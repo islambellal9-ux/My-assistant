@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v3.1 — Telegram bot (Render Web Service)
-مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
+SolAlpha Sniper v3.2 — Telegram bot (Render Web Service)
+مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً — تُقرأ عبر Telethon (MTProto) لا عبر scraping.
 
 /best : يقرأ آخر رسائل القناة → يستخرج عقود Solana → يفحصها ويعطيك أفضل صفقة + نوعها + بدائل
-/diag : تشخيص قراءة القناة وفلترة العقود
+/diag : تشخيص اتصال Telethon وقراءة القناة وفلترة العقود
 /help : شرح
 
 أنواع الصفقات:
@@ -15,13 +15,12 @@ SolAlpha Sniper v3.1 — Telegram bot (Render Web Service)
 الحظر الصلب (لا يُخفَّف أبداً): Mint/Freeze ملغاة، LP محروقة/مقفولة، ليست Rugged، لا Danger في RugCheck.
 أما Dev/Top10/Insider/تقييم RugCheck فتخفض الـ Score وتظهر كتحذيرات (المستوى B).
 
-طريقة قراءة القناة:
-  1) الصفحة العامة للمعاينة https://t.me/s/<channel> (لا تحتاج أي صلاحيات — تعمل مع القنوات العامة)
-  2) اختياري: إن أضفتَ البوت كمشرف في القناة فسيلتقط الرسائل الجديدة مباشرة (channel_post) ويدمجها.
-
-متغيرات البيئة: TELEGRAM_BOT_TOKEN (مطلوب) | PORT و RENDER_EXTERNAL_URL (تضبطهما Render)
-                SIGNAL_CHANNEL (افتراضي solhousesignal) | SIGNAL_PAGES (صفحات المعاينة، افتراضي 2)
-                SIGNAL_MAX_AGE_HOURS (أقصى عمر للإشارة، افتراضي 24) | ALLOW_RISKY=0 للصرامة الكاملة
+متغيرات البيئة:
+  TELEGRAM_BOT_TOKEN (مطلوب) | PORT و RENDER_EXTERNAL_URL (تضبطهما Render)
+  TELEGRAM_API_ID + TELEGRAM_API_HASH (مطلوبان — من https://my.telegram.org → API development tools)
+  TELETHON_SESSION (موصى به) : StringSession تولّدها مرة واحدة محلياً بـ gen_session.py
+  SIGNAL_CHANNEL (افتراضي solhousesignal) | SIGNAL_MESSAGE_LIMIT (افتراضي 60) | SIGNAL_MAX_AGE_HOURS (افتراضي 24)
+  ALLOW_RISKY=0 للصرامة الكاملة
 """
 
 import asyncio
@@ -34,14 +33,15 @@ import signal
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Optional
 
 import httpx
 from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 # ───────────────────────────── الإعدادات ─────────────────────────────
 
@@ -93,9 +93,12 @@ TP2_PCT = 0.25
 
 MAX_DISCOVERED_TOKENS = 150
 
-# قناة الإشارات
+# قناة الإشارات + Telethon
+TG_API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
+TG_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+TG_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 SIGNAL_CHANNEL = os.getenv("SIGNAL_CHANNEL", "solhousesignal").strip().lstrip("@").replace("https://t.me/", "")
-SIGNAL_PAGES = max(1, int(_env_float("SIGNAL_PAGES", 2)))            # كل صفحة ≈ 20 رسالة
+SIGNAL_MESSAGE_LIMIT = max(5, int(_env_float("SIGNAL_MESSAGE_LIMIT", 60)))
 SIGNAL_MAX_AGE_HOURS = _env_float("SIGNAL_MAX_AGE_HOURS", 24)
 MAX_SECURITY_CHECKS = int(_env_float("MAX_SECURITY_CHECKS", 30))
 MAX_CANDLE_FETCH = int(_env_float("MAX_CANDLE_FETCH", 8))
@@ -108,17 +111,6 @@ KEEPALIVE_SEC = 540
 DEX = "https://api.dexscreener.com"
 GECKO = "https://api.geckoterminal.com/api/v2"
 RUGCHECK = "https://api.rugcheck.xyz/v1"
-TME_WEB = "https://t.me/s"
-
-WEB_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "en-US,en;q=0.8",
-    "Cache-Control": "no-cache",
-}
 
 EXCLUDED_MINTS = {
     "So11111111111111111111111111111111111111112",
@@ -218,11 +210,6 @@ DEX_PAIR_URL_RE = re.compile(r"(?i:dexscreener\.com)/solana/([1-9A-HJ-NP-Za-km-z
 # روابط المحافظ/الحسابات ليست عقود عملات
 EXPLORER_URL_RE = re.compile(r"(?i:solscan\.io|solana\.fm|explorer\.solana\.com)/(?:account|address)/\S+")
 
-_POST_RE = re.compile(r'data-post="([^"]+)"')
-_TEXT_RE = re.compile(r'<div class="tgme_widget_message_text js-message_text[^"]*"[^>]*>(.*?)</div>', re.S)
-_PREVIEW_RE = re.compile(r'<a[^>]*tgme_widget_message_link_preview[^>]*href="([^"]+)"')
-_TIME_RE = re.compile(r'<time[^>]*datetime="([^"]+)"')
-_ANCHOR_RE = re.compile(r'<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
 
 
 @dataclass
@@ -260,36 +247,6 @@ def extract_addresses(text: str):
     return mints, hints
 
 
-def _html_to_text(fragment: str) -> str:
-    s = _ANCHOR_RE.sub(lambda m: f" {m.group(1)} {m.group(2)} ", fragment)  # نُبقي قيمة href
-    s = re.sub(r"<br\s*/?>", "\n", s)
-    s = re.sub(r"<[^>]+>", " ", s)
-    return html.unescape(s)
-
-
-def parse_channel_html(page: str) -> list:
-    """يحلل صفحة t.me/s/<channel> → [{id, ts, text}] (كل رسالة مع روابطها)."""
-    matches = list(_POST_RE.finditer(page))
-    out = []
-    for i, mt in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(page)
-        chunk = page[mt.start():end]
-        chan, _, pid = mt.group(1).partition("/")
-        if chan.lower() != SIGNAL_CHANNEL.lower() or not pid.isdigit():
-            continue
-        parts = [_html_to_text(t) for t in _TEXT_RE.findall(chunk)]
-        parts += [html.unescape(u) for u in _PREVIEW_RE.findall(chunk)]
-        ts = None
-        tm = _TIME_RE.search(chunk)
-        if tm:
-            try:
-                ts = datetime.fromisoformat(tm.group(1).replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                ts = None
-        out.append({"id": int(pid), "ts": ts, "text": "\n".join(parts)})
-    return out
-
-
 def fmt_age(minutes: float) -> str:
     if minutes < 1:
         return "الآن"
@@ -300,87 +257,115 @@ def fmt_age(minutes: float) -> str:
     return f"منذ {minutes / 1440:.1f} يوم"
 
 
-async def fetch_channel_html(client: httpx.AsyncClient, before: Optional[int] = None):
-    """يرجع (html, خطأ). before = رقم رسالة للصفحة الأقدم."""
+TL: dict = {"client": None, "error": None}   # حالة عميل Telethon (يُهيّأ في post_init)
+
+
+async def create_telethon():
+    """يرجع (client, خطأ). لا يطلب أي إدخال تفاعلي — يعتمد على TELETHON_SESSION."""
+    if not (TG_API_ID and TG_API_HASH):
+        return None, "TELEGRAM_API_ID / TELEGRAM_API_HASH غير مضبوطين"
     try:
-        r = await client.get(
-            f"{TME_WEB}/{SIGNAL_CHANNEL}",
-            params={"before": before} if before else None,
-            headers=WEB_HEADERS,
-        )
-    except httpx.HTTPError as e:
-        return None, f"تعذر الاتصال بـ t.me ({type(e).__name__})"
-    if r.status_code != 200:
-        return None, f"t.me رجع HTTP {r.status_code}"
-    return r.text, None
+        api_id = int(TG_API_ID)
+    except ValueError:
+        return None, "TELEGRAM_API_ID يجب أن يكون رقماً"
+    client = TelegramClient(StringSession(TG_SESSION), api_id, TG_API_HASH, receive_updates=False)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            if TG_SESSION:
+                await client.disconnect()
+                return None, "TELETHON_SESSION غير صالحة/منتهية — ولّدها من جديد بـ gen_session.py"
+            # بلا جلسة: محاولة الدخول بتوكن البوت (قد لا يسمح تيليغرام للبوتات بقراءة سجل القنوات)
+            log.warning("TELETHON_SESSION غير مضبوطة — محاولة الدخول بتوكن البوت (غير مضمونة)")
+            await client.start(bot_token=TELEGRAM_BOT_TOKEN)
+    except Exception as e:
+        log.exception("Telethon connect failed")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return None, f"فشل اتصال Telethon: {type(e).__name__}: {e}"
+    log.info("Telethon connected")
+    return client, None
 
 
-async def discover_signals(client: httpx.AsyncClient, buffer: Optional[dict] = None):
-    """يقرأ آخر رسائل القناة ويرجع (قائمة Signal الأحدث أولاً، info للتشخيص)."""
+async def _read_channel(tl, limit: int, cutoff: float, info: dict) -> list:
+    """أحدث الرسائل أولاً → [{id, ts, text}] مع نص الرسالة وروابطها (hidden links/أزرار/معاينة)."""
+    out: list = []
+    async for msg in tl.iter_messages(SIGNAL_CHANNEL, limit=limit):
+        ts = msg.date.timestamp() if getattr(msg, "date", None) else None
+        info["messages"] += 1
+        if ts:
+            info["newest_ts"] = max(info.get("newest_ts", 0.0), ts)
+        if ts and ts < cutoff:
+            info["expired"] += 1
+            break  # الرسائل مرتبة من الأحدث → ما بعدها أقدم
+        parts = [msg.raw_text or ""]
+        try:
+            for ent, _txt in msg.get_entities_text():
+                if getattr(ent, "url", None):
+                    parts.append(ent.url)           # رابط مخفي خلف نص
+        except Exception:
+            pass
+        wp = getattr(getattr(msg, "media", None), "webpage", None)
+        if getattr(wp, "url", None):
+            parts.append(wp.url)                    # معاينة الرابط
+        try:
+            for row in msg.buttons or []:
+                for b in row:
+                    if getattr(b, "url", None):
+                        parts.append(b.url)         # أزرار inline
+        except Exception:
+            pass
+        out.append({"id": msg.id, "ts": ts, "text": "\n".join(parts)})
+    return out
+
+
+async def discover_signals():
+    """يقرأ آخر رسائل القناة عبر Telethon ويرجع (قائمة Signal الأحدث أولاً، info للتشخيص)."""
     info = {
-        "web_ok": False, "error": None, "preview_blocked": False,
-        "pages": 0, "messages": 0, "expired": 0, "with_addr": 0,
-        "buffer": 0, "newest_age_min": None,
+        "ok": False, "error": None, "messages": 0, "expired": 0, "with_addr": 0,
+        "addresses": 0, "newest_age_min": None, "newest_ts": 0.0,
     }
+    tl = TL.get("client")
+    if tl is None:
+        info["error"] = TL.get("error") or "عميل Telethon غير مهيّأ"
+        return [], info
+
     now = time.time()
     cutoff = now - SIGNAL_MAX_AGE_HOURS * 3600
     found: dict = {}
-    seen_ids: set = set()
-    newest_ts = 0.0
+    try:
+        msgs = await asyncio.wait_for(_read_channel(tl, SIGNAL_MESSAGE_LIMIT, cutoff, info), timeout=25)
+        info["ok"] = True
+    except asyncio.TimeoutError:
+        info["error"] = "انتهت مهلة قراءة القناة عبر Telethon"
+        return [], info
+    except Exception as e:
+        log.warning("Telethon read failed: %s: %s", type(e).__name__, e)
+        wait = getattr(e, "seconds", None)
+        info["error"] = (
+            f"FloodWait: انتظر {wait} ثانية" if type(e).__name__ == "FloodWaitError" and wait
+            else f"{type(e).__name__}: {e}"
+        )
+        return [], info
 
-    def add(addr: str, post_id: int, ts: Optional[float], is_hint: bool) -> None:
+    def add(addr: str, post_id: int, ts, is_hint: bool) -> None:
         cur = found.get(addr)
         if cur is None or post_id > cur.post_id:
             found[addr] = Signal(addr, post_id, ts, is_hint and not (cur and not cur.is_hint))
 
-    before = None
-    for _ in range(SIGNAL_PAGES):
-        page, err = await fetch_channel_html(client, before)
-        if page is None:
-            info["error"] = err
-            break
-        if "tgme_widget_message" not in page:
-            info["preview_blocked"] = True
-            info["error"] = "القناة لا تعرض معاينة عامة (t.me/s) — أو الاسم غير صحيح"
-            break
-        msgs = [m for m in parse_channel_html(page) if m["id"] not in seen_ids]
-        info["web_ok"] = True
-        info["pages"] += 1
-        if not msgs:
-            break
-        oldest_ts = None
-        for m in msgs:
-            seen_ids.add(m["id"])
-            info["messages"] += 1
-            if m["ts"]:
-                newest_ts = max(newest_ts, m["ts"])
-                oldest_ts = m["ts"] if oldest_ts is None else min(oldest_ts, m["ts"])
-            if m["ts"] and m["ts"] < cutoff:
-                info["expired"] += 1
-                continue
-            mints, hints = extract_addresses(m["text"])
-            if mints or hints:
-                info["with_addr"] += 1
-            for a in mints:
-                add(a, m["id"], m["ts"], False)
-            for a in hints:
-                add(a, m["id"], m["ts"], True)
-        if oldest_ts is not None and oldest_ts < cutoff:
-            break  # وصلنا لرسائل أقدم من الحد المسموح
-        before = min(m["id"] for m in msgs)
-        await asyncio.sleep(0.3)
+    for m in msgs:
+        mints, hints = extract_addresses(m["text"])
+        if mints or hints:
+            info["with_addr"] += 1
+        for a in mints:
+            add(a, m["id"], m["ts"], False)
+        for a in hints:
+            add(a, m["id"], m["ts"], True)
 
-    # رسائل التقطها البوت مباشرة (إن كان مشرفاً في القناة)
-    info["buffer"] = len(buffer or {})
-    for sig in list((buffer or {}).values()):
-        if sig.ts and sig.ts < cutoff:
-            continue
-        if sig.ts:
-            newest_ts = max(newest_ts, sig.ts)
-        add(sig.mint, sig.post_id, sig.ts, sig.is_hint)
-
-    if newest_ts:
-        info["newest_age_min"] = (now - newest_ts) / 60
+    if info["newest_ts"]:
+        info["newest_age_min"] = (now - info["newest_ts"]) / 60
     ordered = sorted(found.values(), key=lambda s: (s.ts or 0, s.post_id), reverse=True)
     info["addresses"] = len(ordered)
     return ordered[:MAX_DISCOVERED_TOKENS], info
@@ -889,7 +874,6 @@ async def run_scan(
     client: httpx.AsyncClient,
     progress=None,
     budget: float = SCAN_BUDGET_SEC,
-    buffer: Optional[dict] = None,
 ) -> ScanResult:
     t0 = time.time()
 
@@ -906,8 +890,8 @@ async def run_scan(
     res = ScanResult()
 
     # 1) قراءة القناة
-    await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL}...")
-    signals, res.sources = await discover_signals(client, buffer)
+    await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL} عبر Telethon...")
+    signals, res.sources = await discover_signals()
     res.signals = len(signals)
     if not signals:
         res.finished_at = time.time()
@@ -1169,7 +1153,7 @@ def format_no_signals(res: ScanResult) -> str:
     if info.get("error"):
         lines.append(f"⚠️ {html.escape(str(info['error']))}")
     else:
-        lines.append(f"• رسائل مقروءة: {info.get('messages', 0)} | منتهية العمر (> {SIGNAL_MAX_AGE_HOURS:.0f}h): {info.get('expired', 0)}")
+        lines.append(f"• رسائل مقروءة: {info.get('messages', 0)} | وصلنا لرسائل أقدم من {SIGNAL_MAX_AGE_HOURS:.0f}h: {'نعم' if info.get('expired') else 'لا'}")
         lines.append(f"• رسائل فيها عقود: {info.get('with_addr', 0)}")
     lines += ["", "💡 جرّب /diag للتفاصيل، أو ارفع SIGNAL_MAX_AGE_HOURS إن كانت إشارات القناة قليلة."]
     return "\n".join(lines)
@@ -1185,7 +1169,7 @@ WELCOME = (
     "🎯 <b>SolAlpha Sniper</b>\n\n"
     "يقرأ آخر إشارات قناة @solhousesignal ويفحص عقودها، ثم يعطيك أفضل صفقة متاحة مع نوعها (سكالبيج / زخم / احتفاظ).\n\n"
     "• /best — أفضل صفقة من إشارات القناة + بدائل\n"
-    "• /diag — تشخيص قراءة القناة\n"
+    "• /diag — تشخيص قراءة القناة (Telethon)\n"
     "• /help — شرح الأنواع والفلاتر\n\n"
     "⚠️ أداة تحليل وليست نصيحة مالية."
 )
@@ -1206,19 +1190,24 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/3.1", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/3.2", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
     application.bot_data["cooldowns"] = {}
     application.bot_data["last_scan"] = None
-    application.bot_data["channel_buffer"] = {}
+    TL["client"], TL["error"] = await create_telethon()
 
 
 async def post_shutdown(application: Application) -> None:
     client = application.bot_data.get("http")
     if client:
         await client.aclose()
+    if TL.get("client"):
+        try:
+            await TL["client"].disconnect()
+        except Exception:
+            pass
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1278,8 +1267,7 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             async with bd["scan_lock"]:
                 res = await asyncio.wait_for(
-                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC, bd.get("channel_buffer")),
-                    timeout=SCAN_BUDGET_SEC + 30,
+                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC), timeout=SCAN_BUDGET_SEC + 30
                 )
                 bd["last_scan"] = res if res.discovered > 0 else None
 
@@ -1321,13 +1309,11 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(f"⏱️ انتظر {wait} ثانية.")
         return
 
-    status_msg = await msg.reply_text("🧪 جارٍ تشخيص قراءة القناة...")
+    status_msg = await msg.reply_text("🧪 جارٍ تشخيص قراءة القناة عبر Telethon...")
     try:
         async with bd["scan_lock"]:
             client = bd["http"]
-            signals, info = await asyncio.wait_for(
-                discover_signals(client, bd.get("channel_buffer")), timeout=40
-            )
+            signals, info = await asyncio.wait_for(discover_signals(), timeout=40)
             addrs = [s.mint for s in signals]
             hints = [s.mint for s in signals if s.is_hint]
             pairs = await asyncio.wait_for(fetch_pairs(client, addrs, hints), timeout=30) if addrs else []
@@ -1346,13 +1332,14 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         age = info.get("newest_age_min")
         lines = [f"🧪 <b>تشخيص قراءة القناة</b> (@{html.escape(SIGNAL_CHANNEL)})", ""]
-        lines.append(f"• المعاينة العامة t.me/s: {'✅ تعمل' if info['web_ok'] else '❌ فشلت'}")
+        lines.append(f"• Telethon: {'✅ متصل' if TL.get('client') else '❌ غير متصل'}"
+                     f" ({'جلسة مستخدم' if TG_SESSION else 'بلا TELETHON_SESSION'})")
+        lines.append(f"• قراءة القناة: {'✅ نجحت' if info['ok'] else '❌ فشلت'}")
         if info.get("error"):
             lines.append(f"   ↳ {html.escape(str(info['error']))}")
         lines += [
-            f"• صفحات مقروءة: {info['pages']} | رسائل: {info['messages']} (منتهية العمر: {info['expired']})",
+            f"• رسائل مقروءة: {info['messages']} (حد القراءة {SIGNAL_MESSAGE_LIMIT})",
             f"• رسائل فيها عقود: {info['with_addr']}",
-            f"• رسائل التقطها البوت مباشرة (channel_post): {info['buffer']}",
             f"• أحدث رسالة: {fmt_age(age) if age is not None else 'غير معروف'}",
             "",
             f"🔢 عقود فريدة مستخرجة: {len(addrs)} | أزواج DexScreener: {len(pairs)}",
@@ -1365,42 +1352,12 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines += ["", "📋 <b>أسباب الاستبعاد:</b>"]
             for reason, n in stats.most_common(12):
                 lines.append(f"• {html.escape(reason)}: {n}")
-        if info.get("preview_blocked"):
-            lines += ["", "ℹ️ إن كانت القناة تمنع المعاينة العامة: أضف البوت كمشرف فيها ليلتقط الرسائل الجديدة مباشرة."]
-        lines += ["", "ℹ️ أسماء/نتائج بقيمة 0 ⚠️ = فشل الطلب أو حظر أو انتهاء المهلة."]
         text = "\n".join(lines)
     except Exception:
         log.exception("Diag failed")
         text = "❌ فشل التشخيص. راجع Logs في Render."
 
     await safe_edit(status_msg, msg, text)
-
-
-async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يعمل فقط إن كان البوت مشرفاً في القناة: يحفظ عقود الرسائل الجديدة لدمجها مع المعاينة العامة."""
-    post = update.channel_post
-    if post is None or (post.chat.username or "").lower() != SIGNAL_CHANNEL.lower():
-        return
-    parts = [post.text or post.caption or ""]
-    for ent in list(post.entities or []) + list(post.caption_entities or []):
-        if getattr(ent, "url", None):
-            parts.append(ent.url)
-    mints, hints = extract_addresses("\n".join(parts))
-    if not (mints or hints):
-        return
-    buf: dict = context.application.bot_data.setdefault("channel_buffer", {})
-    ts = post.date.timestamp() if post.date else time.time()
-    for a in mints:
-        buf[a] = Signal(a, post.message_id, ts, False)
-    for a in hints:
-        if a not in buf:
-            buf[a] = Signal(a, post.message_id, ts, True)
-    cutoff = time.time() - SIGNAL_MAX_AGE_HOURS * 3600
-    for k in [k for k, s in buf.items() if s.ts and s.ts < cutoff]:
-        buf.pop(k, None)
-    while len(buf) > MAX_DISCOVERED_TOKENS:
-        buf.pop(min(buf, key=lambda k: buf[k].ts or 0), None)
-    log.info("channel_post: %d عقد جديد (buffer=%d)", len(mints) + len(hints), len(buf))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1449,7 +1406,6 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
     app.add_error_handler(on_error)
 
     runner = await start_web_server()
@@ -1458,7 +1414,7 @@ async def run_all() -> None:
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
-    log.info("SolAlpha Sniper v3.1 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v3.2 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
