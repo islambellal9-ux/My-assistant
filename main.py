@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v3.2 — Telegram bot (Render Web Service)
-مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً — تُقرأ عبر Telethon (MTProto) لا عبر scraping.
+SolAlpha Sniper v3.4 — Telegram bot (Render Web Service)
+مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً عبر HTTP Mirrors.
 
 /best : يقرأ آخر رسائل القناة → يستخرج عقود Solana → يفحصها ويعطيك أفضل صفقة + نوعها + بدائل
-/diag : تشخيص اتصال Telethon وقراءة القناة وفلترة العقود
+/diag : تشخيص قراءة القناة وفلترة العقود
 /help : شرح
 
 أنواع الصفقات:
@@ -17,9 +17,8 @@ SolAlpha Sniper v3.2 — Telegram bot (Render Web Service)
 
 متغيرات البيئة:
   TELEGRAM_BOT_TOKEN (مطلوب) | PORT و RENDER_EXTERNAL_URL (تضبطهما Render)
-  TELEGRAM_API_ID + TELEGRAM_API_HASH (مطلوبان — من https://my.telegram.org → API development tools)
-  TELETHON_SESSION (موصى به) : StringSession تولّدها مرة واحدة محلياً بـ gen_session.py
-  SIGNAL_CHANNEL (افتراضي solhousesignal) | SIGNAL_MESSAGE_LIMIT (افتراضي 60) | SIGNAL_MAX_AGE_HOURS (افتراضي 24)
+  SIGNAL_HTTP_MIRRORS (اختياري) : قوالب روابط مفصولة بفاصلة، فيها {ch}، تُجرَّب بالترتيب
+  SIGNAL_CHANNEL (افتراضي solhousesignal) | SIGNAL_PAGES (افتراضي 2) | SIGNAL_MAX_AGE_HOURS (افتراضي 24)
   ALLOW_RISKY=0 للصرامة الكاملة
 """
 
@@ -33,6 +32,7 @@ import signal
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional
 
 import httpx
@@ -40,8 +40,6 @@ from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 # ───────────────────────────── الإعدادات ─────────────────────────────
 
@@ -93,12 +91,24 @@ TP2_PCT = 0.25
 
 MAX_DISCOVERED_TOKENS = 150
 
-# قناة الإشارات + Telethon
-TG_API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
-TG_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
-TG_SESSION = os.getenv("TELETHON_SESSION", "").strip()
+# قناة الإشارات
 SIGNAL_CHANNEL = os.getenv("SIGNAL_CHANNEL", "solhousesignal").strip().lstrip("@").replace("https://t.me/", "")
-SIGNAL_MESSAGE_LIMIT = max(5, int(_env_float("SIGNAL_MESSAGE_LIMIT", 60)))
+SIGNAL_PAGES = max(1, int(_env_float("SIGNAL_PAGES", 2)))            # صفحات HTTP، كل صفحة ≈ 20 رسالة
+SIGNAL_HTTP_MIRRORS = [
+    t.strip() for t in os.getenv(
+        "SIGNAL_HTTP_MIRRORS",
+        "https://t.me/s/{ch},https://telegram.me/s/{ch},https://tx.me/s/{ch}",
+    ).split(",") if "{ch}" in t
+]
+WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
 SIGNAL_MAX_AGE_HOURS = _env_float("SIGNAL_MAX_AGE_HOURS", 24)
 MAX_SECURITY_CHECKS = int(_env_float("MAX_SECURITY_CHECKS", 30))
 MAX_CANDLE_FETCH = int(_env_float("MAX_CANDLE_FETCH", 8))
@@ -116,7 +126,6 @@ EXCLUDED_MINTS = {
     "So11111111111111111111111111111111111111112",
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-    # عناوين برامج/نظام تظهر أحياناً في الرسائل وليست عملات
     "11111111111111111111111111111111",
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
@@ -203,21 +212,17 @@ async def fetch_json(
 B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 B58_INDEX = {ch: i for i, ch in enumerate(B58_ALPHABET)}
 
-# عنوان Solana = Base58 بطول 32–44 حرفاً (والتحقق النهائي أنه يفك إلى 32 بايت)
 SOL_ADDR_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
-# روابط DexScreener تحمل عنوان "الزوج" لا العملة → نحلّه لاحقاً عبر endpoint الأزواج
 DEX_PAIR_URL_RE = re.compile(r"(?i:dexscreener\.com)/solana/([1-9A-HJ-NP-Za-km-z]{32,44})")
-# روابط المحافظ/الحسابات ليست عقود عملات
 EXPLORER_URL_RE = re.compile(r"(?i:solscan\.io|solana\.fm|explorer\.solana\.com)/(?:account|address)/\S+")
-
 
 
 @dataclass
 class Signal:
-    mint: str                       # عنوان العملة (أو عنوان زوج إذا is_hint)
+    mint: str
     post_id: int
-    ts: Optional[float]             # وقت نشر الرسالة (epoch ثوانٍ)
-    is_hint: bool = False           # جاء من رابط DexScreener (قد يكون عنوان زوج)
+    ts: Optional[float]
+    is_hint: bool = False
 
 
 def is_valid_solana_address(s: str) -> bool:
@@ -232,7 +237,6 @@ def is_valid_solana_address(s: str) -> bool:
 
 
 def extract_addresses(text: str):
-    """يرجع (عناوين_عقود، عناوين_من_روابط_DexScreener) مرتبة وفريدة."""
     if not text:
         return [], []
     hints: list = []
@@ -257,98 +261,104 @@ def fmt_age(minutes: float) -> str:
     return f"منذ {minutes / 1440:.1f} يوم"
 
 
-TL: dict = {"client": None, "error": None}   # حالة عميل Telethon (يُهيّأ في post_init)
+_POST_RE = re.compile(r'data-post="([^"]+)"')
+_TEXT_RE = re.compile(r'<div class="tgme_widget_message_text js-message_text[^"]*"[^>]*>(.*?)</div>', re.S)
+_PREVIEW_RE = re.compile(r'<a[^>]*tgme_widget_message_link_preview[^>]*href="([^"]+)"')
+_TIME_RE = re.compile(r'<time[^>]*datetime="([^"]+)"')
+_ANCHOR_RE = re.compile(r'<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
 
 
-async def create_telethon():
-    """يرجع (client, خطأ). لا يطلب أي إدخال تفاعلي — يعتمد على TELETHON_SESSION."""
-    if not (TG_API_ID and TG_API_HASH):
-        return None, "TELEGRAM_API_ID / TELEGRAM_API_HASH غير مضبوطين"
-    try:
-        api_id = int(TG_API_ID)
-    except ValueError:
-        return None, "TELEGRAM_API_ID يجب أن يكون رقماً"
-    client = TelegramClient(StringSession(TG_SESSION), api_id, TG_API_HASH, receive_updates=False)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            if TG_SESSION:
-                await client.disconnect()
-                return None, "TELETHON_SESSION غير صالحة/منتهية — ولّدها من جديد بـ gen_session.py"
-            # بلا جلسة: محاولة الدخول بتوكن البوت (قد لا يسمح تيليغرام للبوتات بقراءة سجل القنوات)
-            log.warning("TELETHON_SESSION غير مضبوطة — محاولة الدخول بتوكن البوت (غير مضمونة)")
-            await client.start(bot_token=TELEGRAM_BOT_TOKEN)
-    except Exception as e:
-        log.exception("Telethon connect failed")
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        return None, f"فشل اتصال Telethon: {type(e).__name__}: {e}"
-    log.info("Telethon connected")
-    return client, None
+def _html_to_text(fragment: str) -> str:
+    s = _ANCHOR_RE.sub(lambda m: f" {m.group(1)} {m.group(2)} ", fragment)
+    s = re.sub(r"<br\s*/?>", "\n", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return html.unescape(s)
 
 
-async def _read_channel(tl, limit: int, cutoff: float, info: dict) -> list:
-    """أحدث الرسائل أولاً → [{id, ts, text}] مع نص الرسالة وروابطها (hidden links/أزرار/معاينة)."""
-    out: list = []
-    async for msg in tl.iter_messages(SIGNAL_CHANNEL, limit=limit):
-        ts = msg.date.timestamp() if getattr(msg, "date", None) else None
-        info["messages"] += 1
-        if ts:
-            info["newest_ts"] = max(info.get("newest_ts", 0.0), ts)
-        if ts and ts < cutoff:
-            info["expired"] += 1
-            break  # الرسائل مرتبة من الأحدث → ما بعدها أقدم
-        parts = [msg.raw_text or ""]
-        try:
-            for ent, _txt in msg.get_entities_text():
-                if getattr(ent, "url", None):
-                    parts.append(ent.url)           # رابط مخفي خلف نص
-        except Exception:
-            pass
-        wp = getattr(getattr(msg, "media", None), "webpage", None)
-        if getattr(wp, "url", None):
-            parts.append(wp.url)                    # معاينة الرابط
-        try:
-            for row in msg.buttons or []:
-                for b in row:
-                    if getattr(b, "url", None):
-                        parts.append(b.url)         # أزرار inline
-        except Exception:
-            pass
-        out.append({"id": msg.id, "ts": ts, "text": "\n".join(parts)})
+def parse_channel_html(page: str) -> list:
+    matches = list(_POST_RE.finditer(page))
+    out = []
+    for i, mt in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(page)
+        chunk = page[mt.start():end]
+        chan, _, pid = mt.group(1).partition("/")
+        if chan.lower() != SIGNAL_CHANNEL.lower() or not pid.isdigit():
+            continue
+        parts = [_html_to_text(t) for t in _TEXT_RE.findall(chunk)]
+        parts += [html.unescape(u) for u in _PREVIEW_RE.findall(chunk)]
+        ts = None
+        tm = _TIME_RE.search(chunk)
+        if tm:
+            try:
+                ts = datetime.fromisoformat(tm.group(1).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = None
+        out.append({"id": int(pid), "ts": ts, "text": "\n".join(parts)})
     return out
 
 
-async def discover_signals():
-    """يقرأ آخر رسائل القناة عبر Telethon ويرجع (قائمة Signal الأحدث أولاً، info للتشخيص)."""
+async def discover_signals(client: httpx.AsyncClient):
     info = {
-        "ok": False, "error": None, "messages": 0, "expired": 0, "with_addr": 0,
-        "addresses": 0, "newest_age_min": None, "newest_ts": 0.0,
+        "ok": False, "error": None, "errors": [], "source": None, "messages": 0, "expired": 0,
+        "with_addr": 0, "addresses": 0, "newest_age_min": None, "newest_ts": 0.0,
     }
-    tl = TL.get("client")
-    if tl is None:
-        info["error"] = TL.get("error") or "عميل Telethon غير مهيّأ"
-        return [], info
-
     now = time.time()
     cutoff = now - SIGNAL_MAX_AGE_HOURS * 3600
+    errors: list = info["errors"]
+    msgs: list = []
+    got = False
+
+    for tmpl in SIGNAL_HTTP_MIRRORS:
+        base = tmpl.format(ch=SIGNAL_CHANNEL)
+        host = base.split("/")[2] if "//" in base else base
+        info.update(messages=0, expired=0, newest_ts=0.0)
+        seen: set = set()
+        before = None
+        reached = False
+        temp_msgs = []
+        for _ in range(SIGNAL_PAGES):
+            try:
+                r = await client.get(base, params={"before": before} if before else None, headers=WEB_HEADERS)
+            except httpx.HTTPError as e:
+                errors.append(f"{host}: {type(e).__name__}")
+                break
+            if r.status_code != 200:
+                errors.append(f"{host}: HTTP {r.status_code}")
+                break
+            if "tgme_widget_message" not in r.text:
+                errors.append(f"{host}: لا معاينة عامة أو الطلب محجوب")
+                break
+            reached = True
+            page = [m for m in parse_channel_html(r.text) if m["id"] not in seen]
+            if not page:
+                break
+            oldest = None
+            for m in page:
+                seen.add(m["id"])
+                info["messages"] += 1
+                if m["ts"]:
+                    info["newest_ts"] = max(info["newest_ts"], m["ts"])
+                    oldest = m["ts"] if oldest is None else min(oldest, m["ts"])
+                if m["ts"] and m["ts"] < cutoff:
+                    info["expired"] += 1
+                    continue
+                temp_msgs.append(m)
+            if oldest is not None and oldest < cutoff:
+                break
+            before = min(m["id"] for m in page)
+            await asyncio.sleep(0.3)
+        if reached and temp_msgs:
+            msgs = temp_msgs
+            got = True
+            info["source"] = f"HTTP ({host})"
+            break
+
+    info["ok"] = got
+    if not got:
+        info["error"] = " | ".join(errors)
+        return [], info
+
     found: dict = {}
-    try:
-        msgs = await asyncio.wait_for(_read_channel(tl, SIGNAL_MESSAGE_LIMIT, cutoff, info), timeout=25)
-        info["ok"] = True
-    except asyncio.TimeoutError:
-        info["error"] = "انتهت مهلة قراءة القناة عبر Telethon"
-        return [], info
-    except Exception as e:
-        log.warning("Telethon read failed: %s: %s", type(e).__name__, e)
-        wait = getattr(e, "seconds", None)
-        info["error"] = (
-            f"FloodWait: انتظر {wait} ثانية" if type(e).__name__ == "FloodWaitError" and wait
-            else f"{type(e).__name__}: {e}"
-        )
-        return [], info
 
     def add(addr: str, post_id: int, ts, is_hint: bool) -> None:
         cur = found.get(addr)
@@ -397,7 +407,6 @@ async def fetch_pairs(client: httpx.AsyncClient, addresses: list, pair_hints: An
     best: dict = {}
     _merge_pairs(best, list(responses))
 
-    # عناوين جاءت من روابط DexScreener ولم تُحَل كعملات → نجرّبها كعناوين أزواج
     known_pairs = {p.get("pairAddress") for p in best.values()}
     hints = [h for h in dict.fromkeys(pair_hints) if h not in best and h not in known_pairs]
     if hints:
@@ -490,8 +499,8 @@ def prelim_rank(m: dict) -> float:
 @dataclass
 class Security:
     passed: bool
-    reasons: list = field(default_factory=list)      # حظر صلب
-    warnings: list = field(default_factory=list)     # مخاطرة أعلى (المستوى B)
+    reasons: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
     top10: float = 0.0
     dev: Optional[float] = None
     lp_locked: Optional[float] = None
@@ -648,7 +657,7 @@ class ScalpPlan:
     swing_high: float
     zone_low: float
     zone_high: float
-    status: str            # IN_ZONE | ABOVE_ZONE | WAIT | MOMENTUM | HOLD
+    status: str
     above_pct: float
     entry: float
     tp1: float
@@ -681,7 +690,6 @@ async def fetch_candles(client: httpx.AsyncClient, pool: str) -> list:
 
 
 def compute_scalp_plan(candles: list, price: float):
-    """SCALP: يرجع (ScalpPlan, None) أو (None, سبب_الرفض). WAIT = السعر بعيد فوق المنطقة."""
     if len(candles) < MIN_CANDLES:
         return None, "شموع غير كافية لحساب Fibonacci"
 
@@ -770,7 +778,7 @@ def compute_alt_plan(kind: str, m: dict, candles: list) -> ScalpPlan:
         if candles:
             recent_low = min(c[3] for c in candles[-8:])
             sl = clamp(recent_low * 0.985, price * 0.85, price * 0.93)
-    else:  # HOLD
+    else:
         zone_low, zone_high = price * 0.92, price
         tp1, tp2 = price * 1.50, price * 2.00
         sl = price * 0.75
@@ -797,7 +805,6 @@ def compute_alt_plan(kind: str, m: dict, candles: list) -> ScalpPlan:
 
 
 def compute_score(m: dict, sec: Security, plan: ScalpPlan):
-    """Score /100 = سيولة/MC (20) + فوليوم (20) + زخم (10) + جودة الدخول (25) + أمان (25) − عقوبة مخاطرة."""
     b: dict = {}
     b["liq_mcap"] = 20 * clamp(m["liq_mcap"] / 0.10, 0, 1)
 
@@ -852,7 +859,7 @@ class Candidate:
 
 @dataclass
 class ScanResult:
-    ranked: list = field(default_factory=list)       # كل الصفقات مرتبة بالـ Score
+    ranked: list = field(default_factory=list)
     stats: Counter = field(default_factory=Counter)
     sources: dict = field(default_factory=dict)
     signals: int = 0
@@ -889,9 +896,8 @@ async def run_scan(
 
     res = ScanResult()
 
-    # 1) قراءة القناة
-    await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL} عبر Telethon...")
-    signals, res.sources = await discover_signals()
+    await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL}...")
+    signals, res.sources = await discover_signals(client)
     res.signals = len(signals)
     if not signals:
         res.finished_at = time.time()
@@ -900,7 +906,6 @@ async def run_scan(
     addrs = [s.mint for s in signals]
     hints = [s.mint for s in signals if s.is_hint]
 
-    # 2) بيانات الأزواج
     await say(f"📊 (2/4) جلب بيانات {len(addrs)} عقد من القناة...")
     try:
         pairs = await asyncio.wait_for(fetch_pairs(client, addrs, hints), timeout=min(25.0, left()))
@@ -925,12 +930,11 @@ async def run_scan(
         else:
             pre.append(m)
     if pairs and len(signals) > len(matched):
-        res.stats["عقد بلا زوج على DexScreener (جديد جداً أو ليس عملة)"] += len(signals) - len(matched)
+        res.stats["عقد بلا زوج على DexScreener"] += len(signals) - len(matched)
     res.after_prefilter = len(pre)
     pre.sort(key=prelim_rank, reverse=True)
     pre = pre[:MAX_SECURITY_CHECKS]
 
-    # 3) الأمان
     await say(f"🛡️ (3/4) فحص أمان {len(pre)} عملة عبر RugCheck...")
     sem = asyncio.Semaphore(4)
 
@@ -947,7 +951,7 @@ async def run_scan(
             t.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-            res.stats["انتهت مهلة فحص RugCheck (لم تُفحص)"] += len(pending)
+            res.stats["انتهت مهلة فحص RugCheck"] += len(pending)
         for t in done:
             if t.cancelled() or t.exception() is not None:
                 res.stats["خطأ أثناء فحص RugCheck"] += 1
@@ -962,7 +966,6 @@ async def run_scan(
                 secure.append((m, sec))
     res.after_security = len(secure)
 
-    # 4) الخطط
     await say(f"📈 (4/4) تحليل {len(secure)} عملة آمنة وبناء الخطط...")
     secure.sort(key=lambda ms: prelim_rank(ms[0]), reverse=True)
     candle_map: dict = {}
@@ -1001,7 +1004,7 @@ async def run_scan(
         if hold_ok(m):
             plans.append(compute_alt_plan("HOLD", m, candles))
         if not plans:
-            res.stats["لا تطابق أي نمط (سكالبيج/زخم/احتفاظ)"] += 1
+            res.stats["لا تطابق أي نمط"] += 1
             continue
         for plan in plans:
             score, breakdown = compute_score(m, sec, plan)
@@ -1039,8 +1042,7 @@ def format_best(c: Candidate, alts: list) -> str:
     warn_block = ""
     if risky:
         warn_block = (
-            "🚨 <b>تحذيرات:</b> " + " • ".join(html.escape(w) for w in s.warnings) + "\n"
-            "<i>اجتازت الحظر الصلب (Mint/Freeze/LP/Danger) لكنها ليست نظيفة — حجم صغير جداً.</i>\n\n"
+            "🚨 <b>تحذيرات:</b> " + " • ".join(html.escape(w) for w in s.warnings) + "\n\n"
         )
 
     ident = (
@@ -1053,51 +1055,31 @@ def format_best(c: Candidate, alts: list) -> str:
         f"• Mint ✅ ملغاة | Freeze ✅ ملغاة\n"
         f"• LP: {s.lp_locked:.0f}% محروقة/مقفولة 🔒\n"
         f"• RugCheck: {rug_txt}\n"
-        f"• السيولة: {fmt_usd(m['liq'])} | MC: {fmt_usd(m['mcap'])} | Liq/MC: {m['liq_mcap'] * 100:.1f}%\n"
-        f"• 🐋 Top10: {s.top10:.1f}% | Dev: {dev_txt} | Bundles: {bundle_txt}\n\n"
-        f"⚡ <b>الزخم</b>: 5m {m['chg5']:+.1f}% | 1h {m['chg1']:+.1f}% | 24h {m['chg24']:+.0f}%\n"
-        f"• فوليوم 5m ×{m['vol_pace']:.1f} | ضغط الشراء {m['buy_ratio5'] * 100:.0f}%\n\n"
+        f"• السيولة: {fmt_usd(m['liq'])} | MC: {fmt_usd(m['mcap'])}\n\n"
     )
 
     if p.kind == "SCALP":
         status = (
             "✅ السعر داخل المنطقة الذهبية الآن"
             if p.status == "IN_ZONE"
-            else f"⏳ السعر أعلى المنطقة بـ {p.above_pct:.1f}% — انتظر الارتداد (Limit داخل المنطقة)"
+            else f"⏳ السعر أعلى المنطقة بـ {p.above_pct:.1f}%"
         )
         plan_txt = (
             f"📈 <b>الخطة</b>\n{status}\n"
             f"🟢 Golden Zone (0.5–0.618):\n"
             f"   <code>{fmt_price(p.zone_low)}</code> ← <code>{fmt_price(p.zone_high)}</code>\n"
-            f"   (MC: {mc(p.zone_low)} ← {mc(p.zone_high)})\n"
-            f"🎯 TP1 (+{tp1_pct:.0f}%): <code>{fmt_price(p.tp1)}</code> | MC {mc(p.tp1)} | Fib 1.272: <code>{fmt_price(p.ext1272)}</code>\n"
-            f"🎯 TP2 (+{tp2_pct:.0f}%): <code>{fmt_price(p.tp2)}</code> | MC {mc(p.tp2)} | Fib 1.618: <code>{fmt_price(p.ext1618)}</code>\n"
-            f"🛑 SL (تحت القاع بـ 1.5%): <code>{fmt_price(p.sl)}</code> | MC {mc(p.sl)}\n"
-            f"⚖️ مخاطرة حتى SL: {p.risk_pct:.1f}% | R:R → TP1 {p.rr1:.2f} / TP2 {p.rr2:.2f}\n"
-            f"📐 Swing: {fmt_price(p.swing_low)} → {fmt_price(p.swing_high)} (+{p.leg_pct:.0f}%)\n\n"
+            f"🎯 TP1 (+{tp1_pct:.0f}%): <code>{fmt_price(p.tp1)}</code>\n"
+            f"🎯 TP2 (+{tp2_pct:.0f}%): <code>{fmt_price(p.tp2)}</code>\n"
+            f"🛑 SL: <code>{fmt_price(p.sl)}</code>\n\n"
         )
     else:
-        note = (
-            "لا تطارد السعر إن ارتفع أكثر من 5% عن منطقة الدخول."
-            if p.kind == "MOMENTUM"
-            else "صفقة أبطأ: راقبها يومياً، ولا تعتمد على شمعة واحدة."
-        )
         plan_txt = (
             f"📈 <b>الخطة</b>\n"
             f"🟢 منطقة الدخول: <code>{fmt_price(p.zone_low)}</code> ← <code>{fmt_price(p.zone_high)}</code>\n"
-            f"   (MC: {mc(p.zone_low)} ← {mc(p.zone_high)})\n"
-            f"🎯 TP1 (+{tp1_pct:.0f}%): <code>{fmt_price(p.tp1)}</code> | MC {mc(p.tp1)}\n"
-            f"🎯 TP2 (+{tp2_pct:.0f}%): <code>{fmt_price(p.tp2)}</code> | MC {mc(p.tp2)}\n"
-            f"🛑 SL: <code>{fmt_price(p.sl)}</code> | MC {mc(p.sl)}\n"
-            f"⚖️ مخاطرة حتى SL: {p.risk_pct:.1f}% | R:R → TP1 {p.rr1:.2f} / TP2 {p.rr2:.2f}\n"
-            f"<i>{note}</i>\n\n"
+            f"🎯 TP1: <code>{fmt_price(p.tp1)}</code> | 🎯 TP2: <code>{fmt_price(p.tp2)}</code>\n"
+            f"🛑 SL: <code>{fmt_price(p.sl)}</code>\n\n"
         )
 
-    breakdown = (
-        f"<i>سيولة/MC {b['liq_mcap']:.0f}/20 • فوليوم {b['volume']:.0f}/20 • زخم {b['momentum']:.0f}/10 "
-        f"• دخول {b['fib']:.0f}/25 • أمان {b['safety']:.0f}/25"
-        f"{' • عقوبة −' + str(RISK_PENALTY) if risky else ''}</i>\n"
-    )
     links = (
         f"🔗 <a href=\"https://dexscreener.com/solana/{m['pair']}\">DexScreener</a> • "
         f"<a href=\"https://rugcheck.xyz/tokens/{m['mint']}\">RugCheck</a>\n"
@@ -1112,39 +1094,7 @@ def format_best(c: Candidate, alts: list) -> str:
                 f" — {a.score}/100 {grade_of(a)}\n<code>{a.m['mint']}</code>\n"
             )
 
-    disclaimer = (
-        "\n⚠️ <i>تحليل آلي وليس نصيحة مالية. لا ضمان للربح — لا تدخل بأكثر مما تتحمل خسارته.</i>"
-    )
-    sig_txt = ""
-    post_id = m.get("signal_post")
-    if post_id:
-        ts = m.get("signal_ts")
-        age_min = (time.time() - ts) / 60 if ts else None
-        when = fmt_age(age_min) if age_min is not None else "وقت غير معروف"
-        sig_txt = (
-            f"📡 <b>إشارة القناة</b>: {when} — "
-            f"<a href=\"https://t.me/{SIGNAL_CHANNEL}/{post_id}\">الرسالة الأصلية</a>\n"
-        )
-        if age_min is not None and age_min > 120:
-            sig_txt += "<i>الإشارة قديمة نسبياً — اعتمد على السعر والمنطقة الحاليين لا على سعر الإشارة.</i>\n"
-        sig_txt += "\n"
-    return head + warn_block + ident + sig_txt + safety + plan_txt + breakdown + links + alt_txt + disclaimer
-
-
-def format_no_result(res: ScanResult) -> str:
-    lines = [
-        f"🚫 <b>لا توجد صفقة من إشارات @{html.escape(SIGNAL_CHANNEL)} تجتاز الحظر الصلب الآن</b>",
-        "",
-        f"📡 عقود مستخرجة من القناة: {res.signals} | وُجد لها زوج: {res.discovered}",
-        f"✅ اجتازت الفلتر الأولي: {res.after_prefilter}",
-        f"🛡️ اجتازت الحظر الأمني الصلب: {res.after_security}",
-    ]
-    if res.stats:
-        lines += ["", "📋 <b>أسباب الاستبعاد:</b>"]
-        for reason, n in res.stats.most_common(12):
-            lines.append(f"• {html.escape(reason)}: {n}")
-    lines += ["", "💡 جرّب /diag لتشخيص قراءة القناة، أو انتظر إشارات جديدة ثم أعد المحاولة."]
-    return "\n".join(lines)
+    return head + warn_block + ident + safety + plan_txt + links + alt_txt
 
 
 def format_no_signals(res: ScanResult) -> str:
@@ -1153,10 +1103,12 @@ def format_no_signals(res: ScanResult) -> str:
     if info.get("error"):
         lines.append(f"⚠️ {html.escape(str(info['error']))}")
     else:
-        lines.append(f"• رسائل مقروءة: {info.get('messages', 0)} | وصلنا لرسائل أقدم من {SIGNAL_MAX_AGE_HOURS:.0f}h: {'نعم' if info.get('expired') else 'لا'}")
-        lines.append(f"• رسائل فيها عقود: {info.get('with_addr', 0)}")
-    lines += ["", "💡 جرّب /diag للتفاصيل، أو ارفع SIGNAL_MAX_AGE_HOURS إن كانت إشارات القناة قليلة."]
+        lines.append(f"• رسائل مقروءة: {info.get('messages', 0)}")
     return "\n".join(lines)
+
+
+def format_no_result(res: ScanResult) -> str:
+    return f"🚫 <b>لا توجد صفقة تجتاز الفلتر حالياً من قناة @{html.escape(SIGNAL_CHANNEL)}</b>"
 
 
 def to_plain(text: str) -> str:
@@ -1165,49 +1117,8 @@ def to_plain(text: str) -> str:
 
 # ───────────────────────────── أوامر تلغرام ─────────────────────────────
 
-WELCOME = (
-    "🎯 <b>SolAlpha Sniper</b>\n\n"
-    "يقرأ آخر إشارات قناة @solhousesignal ويفحص عقودها، ثم يعطيك أفضل صفقة متاحة مع نوعها (سكالبيج / زخم / احتفاظ).\n\n"
-    "• /best — أفضل صفقة من إشارات القناة + بدائل\n"
-    "• /diag — تشخيص قراءة القناة (Telethon)\n"
-    "• /help — شرح الأنواع والفلاتر\n\n"
-    "⚠️ أداة تحليل وليست نصيحة مالية."
-)
-
-HELP = (
-    f"📡 <b>المصدر</b>: عقود آخر رسائل @{SIGNAL_CHANNEL} فقط (آخر {SIGNAL_MAX_AGE_HOURS:.0f} ساعة) — لا مسح عشوائي للسوق.\n\n"
-    "🛡️ <b>حظر صلب دائماً</b>: Mint/Freeze ملغاتان • LP محروقة/مقفولة • ليست Rugged • لا Danger في RugCheck.\n\n"
-    f"🧼 <b>المستوى A (نظيف)</b>: Dev ≤ {MAX_DEV_PCT:.0f}% • Top10 ≤ {MAX_TOP10_PCT:.0f}% • بلا Bundled/Insider • RugCheck Good.\n"
-    "⚠️ <b>المستوى B</b>: يظهر مع تحذيرات صريحة وعقوبة في التقييم.\n\n"
-    "<b>الأنواع</b>\n"
-    "⚡ سكالبيج: دخول من Golden Zone، TP +18%/+25%\n"
-    "🚀 زخم: صعود بفوليوم متسارع، TP +15%/+30%\n"
-    "🧭 احتفاظ: عملة 24h+ بسيولة وفوليوم جيدين، TP +50%/+100%\n\n"
-    f"🟢 قوية: A وScore ≥ {MIN_SCORE:.0f} • 🟡 متوسطة: ≥ {RISKY_MIN_SCORE:.0f} • 🟠 ضعيفة: أقل."
-)
-
-
-async def post_init(application: Application) -> None:
-    application.bot_data["http"] = httpx.AsyncClient(
-        timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/3.2", "Accept": "application/json"},
-        follow_redirects=True,
-    )
-    application.bot_data["scan_lock"] = asyncio.Lock()
-    application.bot_data["cooldowns"] = {}
-    application.bot_data["last_scan"] = None
-    TL["client"], TL["error"] = await create_telethon()
-
-
-async def post_shutdown(application: Application) -> None:
-    client = application.bot_data.get("http")
-    if client:
-        await client.aclose()
-    if TL.get("client"):
-        try:
-            await TL["client"].disconnect()
-        except Exception:
-            pass
+WELCOME = "🎯 <b>SolAlpha Sniper v3.4</b>\n\nجاهز لقراءة إشارات قناة @solhousesignal وتحليلها.\n• /best\n• /diag\n• /help"
+HELP = "أداة تحليل صفقات Solana."
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1228,22 +1139,10 @@ def _cooldown_wait(bd: dict, user_id: int) -> int:
 
 
 async def safe_edit(status_msg, original_msg, text: str) -> None:
-    """يضمن وصول الرد دائماً: HTML ثم نص عادي ثم رسالة جديدة."""
     try:
         await status_msg.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        return
     except Exception:
-        log.exception("HTML edit failed")
-    plain = to_plain(text)[:4000]
-    try:
-        await status_msg.edit_text(plain, disable_web_page_preview=True)
-        return
-    except Exception:
-        log.exception("Plain edit failed")
-    try:
-        await original_msg.reply_text(plain, disable_web_page_preview=True)
-    except Exception:
-        log.exception("Reply failed")
+        await original_msg.reply_text(to_plain(text)[:4000], disable_web_page_preview=True)
 
 
 async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1252,50 +1151,27 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     wait = _cooldown_wait(bd, update.effective_user.id)
     if wait:
-        await msg.reply_text(f"⏱️ انتظر {wait} ثانية قبل فحص جديد.")
+        await msg.reply_text(f"⏱️ انتظر {wait} ثانية.")
         return
 
     status_msg = await msg.reply_text("🔎 بدأ المسح...")
-
     async def progress(text: str) -> None:
         await status_msg.edit_text(text)
 
     try:
-        cached = bd.get("last_scan")
-        if cached and time.time() - cached.finished_at < SCAN_CACHE_SEC:
-            res = cached
-        else:
-            async with bd["scan_lock"]:
-                res = await asyncio.wait_for(
-                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC), timeout=SCAN_BUDGET_SEC + 30
-                )
-                bd["last_scan"] = res if res.discovered > 0 else None
-
+        async with bd["scan_lock"]:
+            res = await run_scan(bd["http"], progress, SCAN_BUDGET_SEC)
         if res.signals == 0:
             text = format_no_signals(res)
         elif res.discovered == 0:
-            text = (
-                f"⚠️ وجدتُ {res.signals} عقداً في القناة لكن DexScreener لم يرجع بيانات لأي منها "
-                "(قد تكون جديدة جداً، أو حدّ طلبات). جرّب بعد دقيقة، أو /diag."
-            )
+            text = "⚠️ وجدت عقوداً لكن لم يتم استرجاع بياناتها من DexScreener."
         elif res.ranked:
-            best = res.ranked[0]
-            alts, seen = [], {best.m["mint"]}
-            for c in res.ranked[1:]:
-                if c.m["mint"] in seen:
-                    continue
-                seen.add(c.m["mint"])
-                alts.append(c)
-                if len(alts) == 2:
-                    break
-            text = format_best(best, alts)
+            text = format_best(res.ranked[0], res.ranked[1:3])
         else:
             text = format_no_result(res)
-    except asyncio.TimeoutError:
-        text = "⌛ انتهت مهلة المسح (المصادر بطيئة). حاول مجدداً بعد قليل."
     except Exception:
         log.exception("Scan failed")
-        text = "❌ حدث خطأ أثناء المسح. حاول مجدداً بعد قليل."
+        text = "❌ حدث خطأ أثناء المسح."
 
     await safe_edit(status_msg, msg, text)
 
@@ -1303,68 +1179,31 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     bd = context.application.bot_data
-
-    wait = _cooldown_wait(bd, update.effective_user.id)
-    if wait:
-        await msg.reply_text(f"⏱️ انتظر {wait} ثانية.")
-        return
-
-    status_msg = await msg.reply_text("🧪 جارٍ تشخيص قراءة القناة عبر Telethon...")
+    status_msg = await msg.reply_text("🧪 جارٍ التشخيص...")
     try:
         async with bd["scan_lock"]:
-            client = bd["http"]
-            signals, info = await asyncio.wait_for(discover_signals(), timeout=40)
-            addrs = [s.mint for s in signals]
-            hints = [s.mint for s in signals if s.is_hint]
-            pairs = await asyncio.wait_for(fetch_pairs(client, addrs, hints), timeout=30) if addrs else []
-        stats: Counter = Counter()
-        passed = 0
-        for p in pairs:
-            m = extract_metrics(p)
-            if m is None:
-                stats["بيانات ناقصة"] += 1
-                continue
-            reason = pre_filter(m)
-            if reason:
-                stats[reason] += 1
-            else:
-                passed += 1
-
-        age = info.get("newest_age_min")
-        lines = [f"🧪 <b>تشخيص قراءة القناة</b> (@{html.escape(SIGNAL_CHANNEL)})", ""]
-        lines.append(f"• Telethon: {'✅ متصل' if TL.get('client') else '❌ غير متصل'}"
-                     f" ({'جلسة مستخدم' if TG_SESSION else 'بلا TELETHON_SESSION'})")
-        lines.append(f"• قراءة القناة: {'✅ نجحت' if info['ok'] else '❌ فشلت'}")
-        if info.get("error"):
-            lines.append(f"   ↳ {html.escape(str(info['error']))}")
-        lines += [
-            f"• رسائل مقروءة: {info['messages']} (حد القراءة {SIGNAL_MESSAGE_LIMIT})",
-            f"• رسائل فيها عقود: {info['with_addr']}",
-            f"• أحدث رسالة: {fmt_age(age) if age is not None else 'غير معروف'}",
-            "",
-            f"🔢 عقود فريدة مستخرجة: {len(addrs)} | أزواج DexScreener: {len(pairs)}",
-            f"✅ اجتازت الفلتر الأولي: {passed}",
-        ]
-        missing = len(addrs) - len(pairs)
-        if missing > 0 and pairs:
-            lines.append(f"• بلا زوج على DexScreener: ~{missing}")
-        if stats:
-            lines += ["", "📋 <b>أسباب الاستبعاد:</b>"]
-            for reason, n in stats.most_common(12):
-                lines.append(f"• {html.escape(reason)}: {n}")
-        text = "\n".join(lines)
+            _, info = await discover_signals(bd["http"])
+        text = f"🧪 <b>التشخيص</b>\n• الحالة: {'✅ نجحت' if info['ok'] else '❌ فشلت'}\n• المصدر: {info.get('source')}\n• الخطأ: {info.get('error')}"
     except Exception:
-        log.exception("Diag failed")
-        text = "❌ فشل التشخيص. راجع Logs في Render."
-
+        text = "❌ فشل التشخيص."
     await safe_edit(status_msg, msg, text)
 
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.error("Unhandled exception", exc_info=context.error)
+async def post_init(application: Application) -> None:
+    application.bot_data["http"] = httpx.AsyncClient(
+        timeout=httpx.Timeout(12.0),
+        headers={"User-Agent": "SolAlphaSniper/3.4", "Accept": "application/json"},
+        follow_redirects=True,
+    )
+    application.bot_data["scan_lock"] = asyncio.Lock()
+    application.bot_data["cooldowns"] = {}
+    application.bot_data["last_scan"] = None
 
 
-# ───────────────────────────── Health server + Keep-alive + التشغيل ─────────────────────────────
+async def post_shutdown(application: Application) -> None:
+    client = application.bot_data.get("http")
+    if client:
+        await client.aclose()
 
 
 async def handle_health_check(request: web.Request) -> web.Response:
@@ -1380,24 +1219,7 @@ async def start_web_server() -> web.AppRunner:
     port = int(os.getenv("PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    log.info("Health check server running on port %s", port)
     return runner
-
-
-async def keepalive_loop(client: httpx.AsyncClient) -> None:
-    """يمنع نوم خدمة Render المجانية: طلب HTTP دوري على الرابط العام للخدمة."""
-    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
-    if not url:
-        log.info("Keep-alive disabled (no RENDER_EXTERNAL_URL / SELF_URL)")
-        return
-    target = url.rstrip("/") + "/health"
-    log.info("Keep-alive pinging %s every %ss", target, KEEPALIVE_SEC)
-    while True:
-        await asyncio.sleep(KEEPALIVE_SEC)
-        try:
-            await client.get(target)
-        except Exception as e:
-            log.warning("Keep-alive failed: %s", e)
 
 
 async def run_all() -> None:
@@ -1406,16 +1228,13 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
-    app.add_error_handler(on_error)
 
     runner = await start_web_server()
     await app.initialize()
     await post_init(app)
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-    keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
-    log.info("SolAlpha Sniper v3.2 is running — signal channel: @%s", SIGNAL_CHANNEL)
-
+    
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1423,24 +1242,17 @@ async def run_all() -> None:
             loop.add_signal_handler(sig, stop.set)
         except (NotImplementedError, RuntimeError):
             pass
-
-    try:
-        await stop.wait()
-    finally:
-        log.info("Shutting down...")
-        keepalive.cancel()
-        try:
-            await app.updater.stop()
-            await app.stop()
-            await post_shutdown(app)
-            await app.shutdown()
-        finally:
-            await runner.cleanup()
+    await stop.wait()
+    await app.updater.stop()
+    await app.stop()
+    await post_shutdown(app)
+    await app.shutdown()
+    await runner.cleanup()
 
 
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN غير مضبوط في متغيرات البيئة.")
+        raise SystemExit("TELEGRAM_BOT_TOKEN غير مضبوط.")
     asyncio.run(run_all())
 
 
