@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v3.4 — Telegram bot (Render Web Service)
+SolAlpha Sniper v3.5 — Telegram bot (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -199,6 +199,26 @@ def fmt_price(p: float) -> str:
     return f"{p:.{decimals}f}"
 
 
+API_STATUS: dict = {}   # host -> (آخر حالة، وقتها) — يظهر في /diag وفي رسائل الفشل
+
+
+def _note_api(url: str, status: str) -> None:
+    try:
+        API_STATUS[url.split("/")[2]] = (status, time.time())
+    except IndexError:
+        pass
+
+
+def api_status_text() -> str:
+    names = {"api.dexscreener.com": "DexScreener", "api.geckoterminal.com": "GeckoTerminal", "api.rugcheck.xyz": "RugCheck"}
+    lines = []
+    for host, name in names.items():
+        st = API_STATUS.get(host)
+        if st:
+            lines.append(f"• {name}: {st[0]} (قبل {int(time.time() - st[1])}ث)")
+    return "\n".join(lines) if lines else "• لا توجد معلومات عن حالة المصادر بعد"
+
+
 async def fetch_json(
     client: httpx.AsyncClient,
     url: str,
@@ -209,6 +229,7 @@ async def fetch_json(
     for attempt in range(retries + 1):
         try:
             r = await client.get(url, params=params, headers=headers)
+            _note_api(url, f"HTTP {r.status_code}")
             if r.status_code == 429:
                 await asyncio.sleep(1.2 * (attempt + 1))
                 continue
@@ -216,7 +237,11 @@ async def fetch_json(
                 log.warning("HTTP %s from %s", r.status_code, url)
                 return None
             return r.json()
-        except (httpx.HTTPError, ValueError) as e:
+        except ValueError:
+            _note_api(url, "JSON غير صالح")
+            return None
+        except httpx.HTTPError as e:
+            _note_api(url, type(e).__name__)
             log.warning("Request failed (%s): %s", url, e)
             await asyncio.sleep(0.6 * (attempt + 1))
     return None
@@ -521,17 +546,83 @@ def _merge_pairs(best: dict, payloads: list) -> None:
                 best[base] = p
 
 
-async def fetch_pairs(client: httpx.AsyncClient, addresses: list, pair_hints: Any = ()) -> list:
+async def fetch_gecko_pairs(client: httpx.AsyncClient, mints: list) -> list:
+    """احتياط: GeckoTerminal (tokens/multi + top_pools) محوَّل لشكل أزواج DexScreener."""
+    out: list = []
+    for i in range(0, len(mints), 30):
+        chunk = mints[i:i + 30]
+        data = await fetch_json(
+            client, f"{GECKO}/networks/solana/tokens/multi/{','.join(chunk)}", params={"include": "top_pools"}
+        )
+        if not isinstance(data, dict):
+            continue
+        pools = {p.get("id"): p for p in (data.get("included") or []) if isinstance(p, dict)}
+        for tok in data.get("data") or []:
+            try:
+                ta = tok.get("attributes") or {}
+                mint = ta.get("address")
+                tp = ((tok.get("relationships") or {}).get("top_pools") or {}).get("data") or []
+                pool = pools.get(tp[0].get("id")) if tp else None
+                if not mint or not pool:
+                    continue
+                pa = pool.get("attributes") or {}
+                dex_id = str((((pool.get("relationships") or {}).get("dex") or {}).get("data") or {}).get("id") or "")
+                created_ms = None
+                if pa.get("pool_created_at"):
+                    try:
+                        created_ms = datetime.fromisoformat(str(pa["pool_created_at"]).replace("Z", "+00:00")).timestamp() * 1000
+                    except ValueError:
+                        created_ms = None
+                tx = pa.get("transactions") or {}
+                out.append({
+                    "chainId": "solana",
+                    "dexId": dex_id.replace("-", ""),          # pump-fun → pumpfun
+                    "pairAddress": pa.get("address"),
+                    "baseToken": {"address": mint, "name": ta.get("name"), "symbol": ta.get("symbol")},
+                    "priceUsd": ta.get("price_usd"),
+                    "liquidity": {"usd": pa.get("reserve_in_usd")},
+                    "marketCap": pa.get("market_cap_usd") or ta.get("market_cap_usd"),
+                    "fdv": pa.get("fdv_usd") or ta.get("fdv_usd"),
+                    "volume": pa.get("volume_usd") or {},
+                    "priceChange": pa.get("price_change_percentage") or {},
+                    "txns": {k: {"buys": (v or {}).get("buys"), "sells": (v or {}).get("sells")} for k, v in tx.items()},
+                    "pairCreatedAt": created_ms,
+                })
+            except Exception:
+                log.exception("gecko pair parse failed")
+    return out
+
+
+async def fetch_pairs(client: httpx.AsyncClient, addresses: list, pair_hints: Any = (), sink: Optional[dict] = None) -> list:
+    """sink: قاموس يُملأ تدريجياً فتبقى النتائج الجزئية حتى لو انتهت المهلة."""
+    best: dict = sink if sink is not None else {}
+    hint_set = set(pair_hints)
+    mints = [a for a in addresses if a not in hint_set]
+
+    # 1) DexScreener (الجديد)
     chunks = [addresses[i:i + 30] for i in range(0, len(addresses), 30)]
     responses = await asyncio.gather(
         *(fetch_json(client, f"{DEX}/tokens/v1/solana/{','.join(c)}") for c in chunks)
     )
-    best: dict = {}
     _merge_pairs(best, list(responses))
+
+    # 2) DexScreener (endpoint القديم) لما لم يُحَل
+    missing = [a for a in mints if a not in best]
+    if missing:
+        mchunks = [missing[i:i + 30] for i in range(0, len(missing), 30)]
+        resp2 = await asyncio.gather(
+            *(fetch_json(client, f"{DEX}/latest/dex/tokens/{','.join(c)}") for c in mchunks)
+        )
+        _merge_pairs(best, list(resp2))
+
+    # 3) GeckoTerminal احتياطاً لما لم يُحَل
+    missing = [a for a in mints if a not in best]
+    if missing:
+        _merge_pairs(best, [await fetch_gecko_pairs(client, missing)])
 
     # عناوين جاءت من روابط DexScreener ولم تُحَل كعملات → نجرّبها كعناوين أزواج
     known_pairs = {p.get("pairAddress") for p in best.values()}
-    hints = [h for h in dict.fromkeys(pair_hints) if h not in best and h not in known_pairs]
+    hints = [h for h in dict.fromkeys(hint_set) if h not in best and h not in known_pairs]
     if hints:
         hchunks = [hints[i:i + 30] for i in range(0, len(hints), 30)]
         hresp = await asyncio.gather(
@@ -539,6 +630,27 @@ async def fetch_pairs(client: httpx.AsyncClient, addresses: list, pair_hints: An
         )
         _merge_pairs(best, list(hresp))
     return list(best.values())
+
+
+async def probe_apis(client: httpx.AsyncClient) -> list:
+    """اختبار مباشر لاتصال السيرفر بكل مصدر (يظهر في /diag)."""
+    sol = "So11111111111111111111111111111111111111112"
+    usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    tests = {
+        "DexScreener": f"{DEX}/tokens/v1/solana/{sol}",
+        "GeckoTerminal": f"{GECKO}/networks/solana/tokens/{sol}",
+        "RugCheck": f"{RUGCHECK}/tokens/{usdc}/report",
+    }
+
+    async def one(name: str, url: str):
+        t0 = time.time()
+        try:
+            r = await client.get(url, timeout=10)
+            return name, f"{'✅' if r.status_code == 200 else '❌'} HTTP {r.status_code} ({time.time() - t0:.1f}s)"
+        except Exception as e:
+            return name, f"❌ {type(e).__name__}"
+
+    return list(await asyncio.gather(*(one(n, u) for n, u in tests.items())))
 
 
 # ───────────────────────────── المقاييس والفلترة الأولية ─────────────────────────────
@@ -607,6 +719,41 @@ def pre_filter(m: dict) -> Optional[str]:
     return None
 
 
+def reason_detail(m: dict, reason: str) -> str:
+    """يحوّل سبب الفلتر الأولي إلى جملة بالأرقام الفعلية والحد المطلوب."""
+    try:
+        if reason == "سيولة منخفضة":
+            return f"سيولة {fmt_usd(m['liq'])} (الحد الأدنى {fmt_usd(MIN_LIQUIDITY_USD)})"
+        if reason == "الماركت كاب خارج النطاق":
+            return f"ماركت كاب {fmt_usd(m['mcap'])} (النطاق {fmt_usd(MIN_MCAP_USD)}–{fmt_usd(MAX_MCAP_USD)})"
+        if reason == "عمر الزوج قصير جداً":
+            if m["age_min"] is None:
+                return "عمر الزوج غير معروف"
+            return f"عمر الزوج {m['age_min']:.0f} دقيقة (الحد الأدنى {MIN_PAIR_AGE_MIN:.0f})"
+        if reason == "حجم تداول 1h ضعيف":
+            return f"فوليوم 1h {fmt_usd(m['vol1'])} (الحد الأدنى {fmt_usd(MIN_VOLUME_H1_USD)})"
+        if reason == "انهيار حاد في السعر":
+            return f"هبوط 5د {m['chg5']:+.0f}% / 1h {m['chg1']:+.0f}%"
+        if reason.startswith("ارتفاع مفرط"):
+            return f"صعود 1h {m['chg1']:+.0f}% (الحد {MAX_H1_CHANGE_PCT:.0f}%)"
+        if reason.startswith("لم تهاجر"):
+            return "ما زالت على Bonding Curve (لا LP للفحص) — تُقبل بعد الهجرة"
+    except Exception:
+        pass
+    return reason
+
+
+def sec_detail(sec: "Security") -> str:
+    nums = [f"Top10 {sec.top10:.0f}%"]
+    if sec.dev is not None:
+        nums.append(f"Dev {sec.dev:.1f}%")
+    if sec.lp_locked is not None:
+        nums.append(f"LP {sec.lp_locked:.0f}%")
+    if sec.rug_norm is not None:
+        nums.append(f"RugCheck {sec.rug_norm:.0f}/100")
+    return " + ".join(sec.reasons) + " [" + " • ".join(nums) + "]"
+
+
 def prelim_rank(m: dict) -> float:
     return (
         min(m["vol_pace"], 4)
@@ -639,7 +786,7 @@ async def get_rugcheck_report(client: httpx.AsyncClient, mint: str) -> Optional[
     cached = _RUG_CACHE.get(mint)
     if cached and time.time() - cached[0] < RUGCHECK_CACHE_SEC:
         return cached[1]
-    data = await fetch_json(client, f"{RUGCHECK}/tokens/{mint}/report", retries=1)
+    data = await fetch_json(client, f"{RUGCHECK}/tokens/{mint}/report", retries=2)
     await asyncio.sleep(0.2)
     if isinstance(data, dict):
         _RUG_CACHE[mint] = (time.time(), data)
@@ -989,6 +1136,8 @@ class ScanResult:
     sources: dict = field(default_factory=dict)
     signals: int = 0
     discovered: int = 0
+    verdicts: dict = field(default_factory=dict)   # mint -> {sym, mcap, icon, text}
+    unresolved: list = field(default_factory=list)  # عقود بلا بيانات سوق
     after_prefilter: int = 0
     after_security: int = 0
     finished_at: float = 0.0
@@ -1022,6 +1171,9 @@ async def run_scan(
 
     res = ScanResult()
 
+    def set_v(m: dict, icon: str, text: str) -> None:
+        res.verdicts[m["mint"]] = {"sym": m["symbol"], "mcap": m["mcap"], "icon": icon, "text": text}
+
     # 1) قراءة القناة
     await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL} ...")
     signals, res.sources = await discover_signals(client)
@@ -1040,10 +1192,12 @@ async def run_scan(
 
     # 2) بيانات الأزواج
     await say(f"📊 (2/4) جلب بيانات {len(addrs)} عقد من القناة...")
+    sink: dict = {}
     try:
-        pairs = await asyncio.wait_for(fetch_pairs(client, addrs, hints), timeout=min(25.0, left()))
+        await asyncio.wait_for(fetch_pairs(client, addrs, hints, sink), timeout=min(35.0, left()))
     except asyncio.TimeoutError:
-        pairs = []
+        log.warning("fetch_pairs timed out (partial=%d)", len(sink))
+    pairs = list(sink.values())
     res.discovered = len(pairs)
 
     pre = []
@@ -1060,12 +1214,16 @@ async def run_scan(
         reason = pre_filter(m)
         if reason:
             res.stats[reason] += 1
+            set_v(m, "❌", reason_detail(m, reason))
         else:
             pre.append(m)
+    res.unresolved = [s.mint for s in signals if s.mint not in matched]
     if pairs and len(signals) > len(matched):
         res.stats["عقد بلا زوج على DexScreener (جديد جداً أو ليس عملة)"] += len(signals) - len(matched)
     res.after_prefilter = len(pre)
     pre.sort(key=prelim_rank, reverse=True)
+    for m in pre[MAX_SECURITY_CHECKS:]:
+        set_v(m, "⏭️", f"لم يُفحص أمنياً (حد الفحص {MAX_SECURITY_CHECKS} عملة) — ليس حكماً على العملة")
     pre = pre[:MAX_SECURITY_CHECKS]
 
     # 3) الأمان
@@ -1077,25 +1235,30 @@ async def run_scan(
             report = await get_rugcheck_report(client, m["mint"])
         return m, (analyze_security(report, m["pair"]) if report else None)
 
-    tasks = [asyncio.create_task(check(m)) for m in pre]
+    task_map = {asyncio.create_task(check(m)): m for m in pre}
+    tasks = list(task_map)
     secure: list = []
     if tasks:
         done, pending = await asyncio.wait(tasks, timeout=max(5.0, min(45.0, left() - 25)))
         for t in pending:
             t.cancel()
+            set_v(task_map[t], "⏱️", "انتهت مهلة RugCheck — لم تُفحص (ليس حكماً على العملة)")
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
             res.stats["انتهت مهلة فحص RugCheck (لم تُفحص)"] += len(pending)
         for t in done:
             if t.cancelled() or t.exception() is not None:
                 res.stats["خطأ أثناء فحص RugCheck"] += 1
+                set_v(task_map[t], "⚠️", "خطأ أثناء فحص RugCheck — ليس حكماً على العملة")
                 continue
             m, sec = t.result()
             if sec is None:
                 res.stats["تعذر جلب تقرير RugCheck"] += 1
+                set_v(m, "⚠️", "تعذر جلب تقرير RugCheck (حد طلبات/غير مفهرسة) — ليس حكماً على العملة")
             elif not sec.passed:
                 for r in sec.reasons:
                     res.stats[r] += 1
+                set_v(m, "🛡️", sec_detail(sec))
             else:
                 secure.append((m, sec))
     res.after_security = len(secure)
@@ -1128,18 +1291,28 @@ async def run_scan(
     for m, sec in secure:
         candles = candle_map.get(m["mint"], [])
         plans = []
+        scalp_reason = None
         if candles:
             plan, reject = compute_scalp_plan(candles, m["price"])
             if plan is not None and plan.status != "WAIT":
                 plans.append(plan)
             elif reject:
                 res.stats[reject] += 1
+                scalp_reason = reject
+            else:
+                scalp_reason = "السعر بعيد فوق المنطقة الذهبية (انتظر تصحيحاً)"
         if momentum_ok(m):
             plans.append(compute_alt_plan("MOMENTUM", m, candles))
         if hold_ok(m):
             plans.append(compute_alt_plan("HOLD", m, candles))
         if not plans:
             res.stats["لا تطابق أي نمط (سكالبيج/زخم/احتفاظ)"] += 1
+            detail = (
+                f"اجتازت الأمان لكن بلا نمط دخول — 1h {m['chg1']:+.0f}% • 5د {m['chg5']:+.0f}% • "
+                f"وتيرة الفوليوم {m['vol_pace']:.1f}x • شراء 5د {m['buy_ratio5'] * 100:.0f}%"
+            )
+            detail += f" • سكالبيج: {scalp_reason}" if scalp_reason else " • سكالبيج: لم تُجلب شموع"
+            set_v(m, "📉", detail)
             continue
         for plan in plans:
             score, breakdown = compute_score(m, sec, plan)
@@ -1147,6 +1320,10 @@ async def run_scan(
 
     ranked.sort(key=lambda c: c.score, reverse=True)
     res.ranked = ranked
+    for c in ranked:
+        v = res.verdicts.get(c.m["mint"])
+        if v is None or v["icon"] != "✅":
+            set_v(c.m, "✅", f"Score {c.score} — {KIND_SHORT[c.plan.kind]} ({grade_of(c)})")
     res.finished_at = time.time()
     return res
 
@@ -1288,6 +1465,22 @@ def format_no_result(res: ScanResult) -> str:
     return "\n".join(lines)
 
 
+def format_verdicts(res: ScanResult, limit: int = 14) -> str:
+    items = sorted(res.verdicts.values(), key=lambda v: (0 if v["icon"] == "✅" else 1, -v["mcap"]))
+    total = len(items) + len(res.unresolved)
+    lines = [f"📋 <b>تقرير كل عقد ({total})</b>", ""]
+    for v in items[:limit]:
+        lines.append(f"{v['icon']} <b>{html.escape(v['sym'])}</b> ({fmt_usd(v['mcap'])}) — {html.escape(v['text'])}")
+    room = max(0, limit - len(items))
+    for a in res.unresolved[:room]:
+        lines.append(f"❔ <code>{a[:5]}…{a[-4:]}</code> — لا بيانات سوق من DexScreener/GeckoTerminal (جديدة جداً أو غير مدرجة)")
+    shown = min(len(items), limit) + min(len(res.unresolved), room)
+    if total > shown:
+        lines.append(f"… و{total - shown} أخرى")
+    lines += ["", "💡 كل حد أعلاه قابل للتعديل من متغيرات البيئة (MIN_PAIR_AGE_MIN، MIN_LIQUIDITY_USD، MIN_VOLUME_H1_USD…)."]
+    return "\n".join(lines)
+
+
 def format_no_signals(res: ScanResult) -> str:
     info = res.sources if isinstance(res.sources, dict) else {}
     lines = [f"📡 <b>لم أجد عقوداً صالحة في قناة @{html.escape(SIGNAL_CHANNEL)}</b>", ""]
@@ -1324,6 +1517,7 @@ HELP = (
     "📥 <b>الوضع اليدوي</b>: الصق عنوان عقد أو حوّل (Forward) رسالة إشارة إلى البوت، ثم أرسل /best. "
     f"تبقى العقود {MANUAL_TTL_HOURS:.0f} ساعة أو حتى /clear.\n\n"
     f"📡 <b>المصدر</b>: عقود آخر رسائل @{SIGNAL_CHANNEL} فقط (آخر {SIGNAL_MAX_AGE_HOURS:.0f} ساعة) — لا مسح عشوائي للسوق.\n\n"
+    "📋 بعد كل /best تصلك رسالة «تقرير كل عقد» بسبب قبول/رفض كل عملة بالأرقام.\n\n"
     "🛡️ <b>حظر صلب دائماً</b>: Mint/Freeze ملغاتان • LP محروقة/مقفولة • ليست Rugged • لا Danger في RugCheck.\n\n"
     f"🧼 <b>المستوى A (نظيف)</b>: Dev ≤ {MAX_DEV_PCT:.0f}% • Top10 ≤ {MAX_TOP10_PCT:.0f}% • بلا Bundled/Insider • RugCheck Good.\n"
     "⚠️ <b>المستوى B</b>: يظهر مع تحذيرات صريحة وعقوبة في التقييم.\n\n"
@@ -1338,7 +1532,7 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/3.4", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/3.5", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -1392,6 +1586,17 @@ async def safe_edit(status_msg, original_msg, text: str) -> None:
         await original_msg.reply_text(plain, disable_web_page_preview=True)
     except Exception:
         log.exception("Reply failed")
+
+
+async def safe_send(msg, text: str) -> None:
+    try:
+        await msg.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        log.exception("HTML send failed")
+        try:
+            await msg.reply_text(to_plain(text)[:4000], disable_web_page_preview=True)
+        except Exception:
+            log.exception("Plain send failed")
 
 
 def _manual_store(bd: dict, uid: int) -> dict:
@@ -1472,6 +1677,7 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async def progress(text: str) -> None:
         await status_msg.edit_text(text)
 
+    res = None
     try:
         extras = list(_manual_store(bd, update.effective_user.id).values())
         cached = bd.get("last_scan") if not extras else None
@@ -1488,8 +1694,11 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text = format_no_signals(res)
         elif res.discovered == 0:
             text = (
-                f"⚠️ وجدتُ {res.signals} عقداً لكن DexScreener لم يرجع بيانات لأي منها "
-                "(قد تكون جديدة جداً، أو حدّ طلبات). جرّب بعد دقيقة، أو /diag."
+                f"⚠️ وجدتُ {res.signals} عقداً لكن لم أحصل على بيانات سوق لأي منها.\n\n"
+                f"حالة المصادر:\n{api_status_text()}\n\n"
+                "• HTTP 403/429 أو timeout ⇒ المشكلة في اتصال سيرفر Render بالمصدر (جرّب بعد دقيقة).\n"
+                "• HTTP 200 ⇒ العقود غير مدرجة بعد (جديدة جداً أو ما زالت قبل الإدراج).\n"
+                "شغّل /diag لاختبار المصادر مباشرة."
             )
         elif res.ranked:
             best = res.ranked[0]
@@ -1511,6 +1720,8 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = "❌ حدث خطأ أثناء المسح. حاول مجدداً بعد قليل."
 
     await safe_edit(status_msg, msg, text)
+    if res is not None and (res.verdicts or res.unresolved):
+        await safe_send(msg, format_verdicts(res))
 
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1529,7 +1740,14 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             signals, info = await asyncio.wait_for(discover_signals(client), timeout=60)
             addrs = [s.mint for s in signals]
             hints = [s.mint for s in signals if s.is_hint]
-            pairs = await asyncio.wait_for(fetch_pairs(client, addrs, hints), timeout=30) if addrs else []
+            sink: dict = {}
+            if addrs:
+                try:
+                    await asyncio.wait_for(fetch_pairs(client, addrs, hints, sink), timeout=40)
+                except asyncio.TimeoutError:
+                    pass
+            pairs = list(sink.values())
+            probes = await probe_apis(client)
         stats: Counter = Counter()
         passed = 0
         for p in pairs:
@@ -1563,6 +1781,7 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         missing = len(addrs) - len(pairs)
         if missing > 0 and pairs:
             lines.append(f"• بلا زوج على DexScreener: ~{missing}")
+        lines += ["", "🌐 <b>اختبار المصادر من السيرفر:</b>"] + [f"• {n}: {r}" for n, r in probes]
         if stats:
             lines += ["", "📋 <b>أسباب الاستبعاد:</b>"]
             for reason, n in stats.most_common(12):
@@ -1633,7 +1852,7 @@ async def run_all() -> None:
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
-    log.info("SolAlpha Sniper v3.4 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v3.5 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
