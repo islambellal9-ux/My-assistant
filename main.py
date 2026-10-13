@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v3.3 — Telegram bot (Render Web Service)
+SolAlpha Sniper v3.4 — Telegram bot (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
-طريقة القراءة (بالترتيب): 1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
+طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
+                          1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
                           2) HTTP على مرايا المعاينة العامة (t.me/s وأخواتها) كاحتياط
 ملاحظة: حسابات البوت لا تستطيع قراءة سجل القنوات (BotMethodInvalidError) فلا تُستخدم.
 
@@ -44,7 +45,7 @@ import httpx
 from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
@@ -104,6 +105,8 @@ TG_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 TG_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 SIGNAL_CHANNEL = os.getenv("SIGNAL_CHANNEL", "solhousesignal").strip().lstrip("@").replace("https://t.me/", "")
 SIGNAL_MESSAGE_LIMIT = max(5, int(_env_float("SIGNAL_MESSAGE_LIMIT", 60)))
+MANUAL_TTL_HOURS = _env_float("MANUAL_TTL_HOURS", 12)
+MANUAL_MAX = 60
 SIGNAL_PAGES = max(1, int(_env_float("SIGNAL_PAGES", 2)))            # صفحات HTTP، كل صفحة ≈ 20 رسالة
 SIGNAL_HTTP_MIRRORS = [
     t.strip() for t in os.getenv(
@@ -239,6 +242,8 @@ class Signal:
     post_id: int
     ts: Optional[float]             # وقت نشر الرسالة (epoch ثوانٍ)
     is_hint: bool = False           # جاء من رابط DexScreener (قد يكون عنوان زوج)
+    manual: bool = False            # أرسله المستخدم يدوياً (لصق/Forward)
+    added: float = 0.0              # وقت استلام البوت له (للوضع اليدوي)
 
 
 def is_valid_solana_address(s: str) -> bool:
@@ -1001,6 +1006,7 @@ async def run_scan(
     client: httpx.AsyncClient,
     progress=None,
     budget: float = SCAN_BUDGET_SEC,
+    extra: Optional[list] = None,
 ) -> ScanResult:
     t0 = time.time()
 
@@ -1019,6 +1025,11 @@ async def run_scan(
     # 1) قراءة القناة
     await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL} ...")
     signals, res.sources = await discover_signals(client)
+    if extra:  # عقود أرسلها المستخدم يدوياً (تُدمج مع عقود القناة، وعقد القناة له الأولوية)
+        have = {s.mint for s in signals}
+        signals = [e for e in extra if e.mint not in have] + signals
+        signals = signals[:MAX_DISCOVERED_TOKENS]
+        res.sources["manual"] = len(extra)
     res.signals = len(signals)
     if not signals:
         res.finished_at = time.time()
@@ -1044,7 +1055,7 @@ async def run_scan(
             continue
         sig = sig_map.get(m["mint"]) or sig_map.get(m["pair"])
         if sig:
-            m["signal_ts"], m["signal_post"] = sig.ts, sig.post_id
+            m["signal_ts"], m["signal_post"], m["signal_manual"] = sig.ts, sig.post_id, sig.manual
             matched.add(sig.mint)
         reason = pre_filter(m)
         if reason:
@@ -1244,7 +1255,10 @@ def format_best(c: Candidate, alts: list) -> str:
     )
     sig_txt = ""
     post_id = m.get("signal_post")
-    if post_id:
+    if m.get("signal_manual") and not post_id:
+        ts = m.get("signal_ts")
+        sig_txt = "📥 <b>المصدر</b>: عقد أرسلتَه يدوياً" + (f" — الإشارة {fmt_age((time.time() - ts) / 60)}" if ts else "") + "\n\n"
+    elif post_id:
         ts = m.get("signal_ts")
         age_min = (time.time() - ts) / 60 if ts else None
         when = fmt_age(age_min) if age_min is not None else "وقت غير معروف"
@@ -1262,7 +1276,7 @@ def format_no_result(res: ScanResult) -> str:
     lines = [
         f"🚫 <b>لا توجد صفقة من إشارات @{html.escape(SIGNAL_CHANNEL)} تجتاز الحظر الصلب الآن</b>",
         "",
-        f"📡 عقود مستخرجة من القناة: {res.signals} | وُجد لها زوج: {res.discovered}",
+        f"📡 عقود مفحوصة (القناة + يدوي): {res.signals} | وُجد لها زوج: {res.discovered}",
         f"✅ اجتازت الفلتر الأولي: {res.after_prefilter}",
         f"🛡️ اجتازت الحظر الأمني الصلب: {res.after_security}",
     ]
@@ -1282,8 +1296,9 @@ def format_no_signals(res: ScanResult) -> str:
     else:
         lines.append(f"• رسائل مقروءة: {info.get('messages', 0)} | وصلنا لرسائل أقدم من {SIGNAL_MAX_AGE_HOURS:.0f}h: {'نعم' if info.get('expired') else 'لا'}")
         lines.append(f"• رسائل فيها عقود: {info.get('with_addr', 0)}")
+    lines += ["", "📥 <b>الوضع اليدوي</b>: حوّل لي (Forward) رسائل الإشارات من القناة، أو الصق العقود هنا، ثم أرسل /best."]
     if not TG_SESSION:
-        lines += ["", "🔑 أهم خطوة: ولّد TELETHON_SESSION (حساب مستخدم) بـ gen_session.py وضعها في Render."]
+        lines += ["🔑 (للقراءة التلقائية: TELETHON_SESSION بجلسة حساب مستخدم.)"]
     lines += ["", "💡 جرّب /diag للتفاصيل، أو ارفع SIGNAL_MAX_AGE_HOURS إن كانت إشارات القناة قليلة."]
     return "\n".join(lines)
 
@@ -1298,12 +1313,16 @@ WELCOME = (
     "🎯 <b>SolAlpha Sniper</b>\n\n"
     "يقرأ آخر إشارات قناة @solhousesignal ويفحص عقودها، ثم يعطيك أفضل صفقة متاحة مع نوعها (سكالبيج / زخم / احتفاظ).\n\n"
     "• /best — أفضل صفقة من إشارات القناة + بدائل\n"
+    "• أرسل لي عقداً (أو حوّل رسالة إشارة من القناة) ثم /best لتحليله\n"
+    "• /clear — مسح العقود التي أرسلتها\n"
     "• /diag — تشخيص قراءة القناة (Telethon)\n"
     "• /help — شرح الأنواع والفلاتر\n\n"
     "⚠️ أداة تحليل وليست نصيحة مالية."
 )
 
 HELP = (
+    "📥 <b>الوضع اليدوي</b>: الصق عنوان عقد أو حوّل (Forward) رسالة إشارة إلى البوت، ثم أرسل /best. "
+    f"تبقى العقود {MANUAL_TTL_HOURS:.0f} ساعة أو حتى /clear.\n\n"
     f"📡 <b>المصدر</b>: عقود آخر رسائل @{SIGNAL_CHANNEL} فقط (آخر {SIGNAL_MAX_AGE_HOURS:.0f} ساعة) — لا مسح عشوائي للسوق.\n\n"
     "🛡️ <b>حظر صلب دائماً</b>: Mint/Freeze ملغاتان • LP محروقة/مقفولة • ليست Rugged • لا Danger في RugCheck.\n\n"
     f"🧼 <b>المستوى A (نظيف)</b>: Dev ≤ {MAX_DEV_PCT:.0f}% • Top10 ≤ {MAX_TOP10_PCT:.0f}% • بلا Bundled/Insider • RugCheck Good.\n"
@@ -1319,7 +1338,7 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/3.3", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/3.4", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -1375,6 +1394,70 @@ async def safe_edit(status_msg, original_msg, text: str) -> None:
         log.exception("Reply failed")
 
 
+def _manual_store(bd: dict, uid: int) -> dict:
+    store = bd.setdefault("manual", {}).setdefault(uid, {})
+    cutoff = time.time() - MANUAL_TTL_HOURS * 3600
+    for k in [k for k, s in store.items() if s.added < cutoff]:
+        store.pop(k, None)
+    return store
+
+
+async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يلتقط العقود من رسالة نصية أو محوّلة (Forward) ويحفظها لهذا المستخدم."""
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+    parts = [msg.text or msg.caption or ""]
+    for ent in list(msg.entities or []) + list(msg.caption_entities or []):
+        if getattr(ent, "url", None):
+            parts.append(ent.url)                       # رابط مخفي خلف نص
+    rm = getattr(msg, "reply_markup", None)
+    for row in getattr(rm, "inline_keyboard", None) or []:
+        for b in row:
+            if getattr(b, "url", None):
+                parts.append(b.url)                     # أزرار الرسالة المحوّلة
+    mints, hints = extract_addresses("\n".join(parts))
+    if not (mints or hints):
+        await msg.reply_text("لم أجد عنوان عقد Solana في هذه الرسالة. الصق العقد أو حوّل لي رسالة الإشارة، ثم أرسل /best.")
+        return
+
+    ts, post_id = None, 0                               # ts يبقى None للصق العادي
+    fo = getattr(msg, "forward_origin", None)
+    if fo is not None:
+        d = getattr(fo, "date", None)
+        ts = d.timestamp() if d else None
+        chat = getattr(fo, "chat", None)
+        if chat is not None and (getattr(chat, "username", "") or "").lower() == SIGNAL_CHANNEL.lower():
+            post_id = getattr(fo, "message_id", 0) or 0
+    elif getattr(msg, "forward_date", None):            # توافق مع إصدارات PTB الأقدم
+        ts = msg.forward_date.timestamp()
+        fc = getattr(msg, "forward_from_chat", None)
+        if fc is not None and (getattr(fc, "username", "") or "").lower() == SIGNAL_CHANNEL.lower():
+            post_id = getattr(msg, "forward_from_message_id", 0) or 0
+
+    store = _manual_store(context.application.bot_data, user.id)
+    now = time.time()
+    for a in mints:
+        store[a] = Signal(a, post_id, ts, False, True, now)
+    for a in hints:
+        if a not in store:
+            store[a] = Signal(a, post_id, ts, True, True, now)
+    while len(store) > MANUAL_MAX:
+        store.pop(min(store, key=lambda k: store[k].added), None)
+    await msg.reply_text(
+        f"✅ استلمت {len(mints) + len(hints)} عقد. إجمالي المنتظر للتحليل: {len(store)}.\n"
+        "حوّل المزيد، أو أرسل /best للتحليل (و/clear للمسح)."
+    )
+
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = _manual_store(context.application.bot_data, update.effective_user.id)
+    n = len(store)
+    store.clear()
+    await update.effective_message.reply_text(f"🧹 مُسح {n} عقد.")
+
+
 async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     bd = context.application.bot_data
@@ -1390,21 +1473,22 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.edit_text(text)
 
     try:
-        cached = bd.get("last_scan")
+        extras = list(_manual_store(bd, update.effective_user.id).values())
+        cached = bd.get("last_scan") if not extras else None
         if cached and time.time() - cached.finished_at < SCAN_CACHE_SEC:
             res = cached
         else:
             async with bd["scan_lock"]:
                 res = await asyncio.wait_for(
-                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC), timeout=SCAN_BUDGET_SEC + 30
+                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC, extras), timeout=SCAN_BUDGET_SEC + 30
                 )
-                bd["last_scan"] = res if res.discovered > 0 else None
+                bd["last_scan"] = res if (res.discovered > 0 and not extras) else None
 
         if res.signals == 0:
             text = format_no_signals(res)
         elif res.discovered == 0:
             text = (
-                f"⚠️ وجدتُ {res.signals} عقداً في القناة لكن DexScreener لم يرجع بيانات لأي منها "
+                f"⚠️ وجدتُ {res.signals} عقداً لكن DexScreener لم يرجع بيانات لأي منها "
                 "(قد تكون جديدة جداً، أو حدّ طلبات). جرّب بعد دقيقة، أو /diag."
             )
         elif res.ranked:
@@ -1459,6 +1543,7 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 passed += 1
 
+        manual_n = len(_manual_store(bd, update.effective_user.id))
         age = info.get("newest_age_min")
         lines = [f"🧪 <b>تشخيص قراءة القناة</b> (@{html.escape(SIGNAL_CHANNEL)})", ""]
         lines.append(f"• Telethon: {'✅ متصل (جلسة مستخدم)' if TL.get('client') else '❌ غير متصل'}")
@@ -1470,6 +1555,7 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"• رسائل مقروءة: {info['messages']} ",
             f"• رسائل فيها عقود: {info['with_addr']}",
             f"• أحدث رسالة: {fmt_age(age) if age is not None else 'غير معروف'}",
+            f"• عقود أرسلتها يدوياً (منتظرة): {manual_n}",
             "",
             f"🔢 عقود فريدة مستخرجة: {len(addrs)} | أزواج DexScreener: {len(pairs)}",
             f"✅ اجتازت الفلتر الأولي: {passed}",
@@ -1535,6 +1621,10 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT | filters.CAPTION), on_user_message
+    ))
     app.add_error_handler(on_error)
 
     runner = await start_web_server()
@@ -1543,7 +1633,7 @@ async def run_all() -> None:
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
-    log.info("SolAlpha Sniper v3.3 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v3.4 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
