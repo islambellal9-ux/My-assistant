@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v3.5 — Telegram bot (Render Web Service)
+SolAlpha Sniper v3.6 — Telegram bot (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -65,11 +65,16 @@ MIN_SCORE = _env_float("MIN_SCORE", 80)            # 🟢 قوية (مع الم�
 RISKY_MIN_SCORE = _env_float("RISKY_MIN_SCORE", 65)  # 🟡 متوسطة
 
 # فلتر أولي صلب
-MIN_LIQUIDITY_USD = _env_float("MIN_LIQUIDITY_USD", 15_000)
-MIN_VOLUME_H1_USD = _env_float("MIN_VOLUME_H1_USD", 8_000)
-MIN_MCAP_USD = _env_float("MIN_MCAP_USD", 30_000)
+MIN_LIQUIDITY_USD = _env_float("MIN_LIQUIDITY_USD", 8_000)
+MIN_VOLUME_H1_USD = _env_float("MIN_VOLUME_H1_USD", 5_000)
+MIN_MCAP_USD = _env_float("MIN_MCAP_USD", 15_000)
 MAX_MCAP_USD = _env_float("MAX_MCAP_USD", 100_000_000)
-MIN_PAIR_AGE_MIN = _env_float("MIN_PAIR_AGE_MIN", 45)
+MIN_PAIR_AGE_MIN = _env_float("MIN_PAIR_AGE_MIN", 10)
+# تحت هذه القيم تُقبل العملة لكن بتحذير صريح وعقوبة في التقييم (لا تُرفض)
+FLAG_LIQ_USD = _env_float("FLAG_LIQ_USD", 15_000)
+FLAG_MCAP_USD = _env_float("FLAG_MCAP_USD", 30_000)
+FLAG_AGE_MIN = _env_float("FLAG_AGE_MIN", 45)
+MARKET_FLAG_PENALTY = 4
 MAX_H1_CHANGE_PCT = _env_float("MAX_H1_CHANGE_PCT", 300)
 MAX_5M_DROP_PCT = _env_float("MAX_5M_DROP_PCT", 10)
 MAX_1H_DROP_PCT = _env_float("MAX_1H_DROP_PCT", 25)
@@ -942,11 +947,21 @@ class ScalpPlan:
     kind: str = "SCALP"
 
 
-async def fetch_candles(client: httpx.AsyncClient, pool: str) -> list:
+def candle_tf(age_min: Optional[float]) -> int:
+    """العملة الحديثة (<3 ساعات) لا تملك 20 شمعة 5د، فنستعمل شموع الدقيقة (كما يتداولها المستخدم عادة)."""
+    return 1 if (age_min is not None and age_min < 180) else 5
+
+
+def fib_params(tf: int):
+    """(أقل عدد شموع، نافذة التحليل، نظرة الـ Swing) حسب الإطار الزمني."""
+    return (25, 120, 60) if tf == 1 else (MIN_CANDLES, MAX_WINDOW_CANDLES, SWING_LOOKBACK_CANDLES)
+
+
+async def fetch_candles(client: httpx.AsyncClient, pool: str, tf: int = 5) -> list:
     data = await fetch_json(
         client,
         f"{GECKO}/networks/solana/pools/{pool}/ohlcv/minute",
-        params={"aggregate": 5, "limit": 100, "currency": "usd"},
+        params={"aggregate": tf, "limit": 200 if tf == 1 else 100, "currency": "usd"},
     )
     rows = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") if isinstance(data, dict) else None
     candles = []
@@ -959,15 +974,16 @@ async def fetch_candles(client: httpx.AsyncClient, pool: str) -> list:
     return candles
 
 
-def compute_scalp_plan(candles: list, price: float):
+def compute_scalp_plan(candles: list, price: float, tf: int = 5):
     """SCALP: يرجع (ScalpPlan, None) أو (None, سبب_الرفض). WAIT = السعر بعيد فوق المنطقة."""
-    if len(candles) < MIN_CANDLES:
+    min_c, max_w, lookback = fib_params(tf)
+    if len(candles) < min_c:
         return None, "شموع غير كافية لحساب Fibonacci"
 
-    window = candles[-MAX_WINDOW_CANDLES:]
+    window = candles[-max_w:]
     hi_idx = max(range(len(window)), key=lambda i: window[i][2])
     high = window[hi_idx][2]
-    seg = window[max(0, hi_idx - SWING_LOOKBACK_CANDLES): hi_idx + 1]
+    seg = window[max(0, hi_idx - lookback): hi_idx + 1]
     lo_rel = min(range(len(seg)), key=lambda i: seg[i][3])
     low = seg[lo_rel][3]
     if lo_rel == len(seg) - 1:
@@ -1020,12 +1036,12 @@ def compute_scalp_plan(candles: list, price: float):
 
 
 def momentum_ok(m: dict) -> bool:
-    return (
-        3 <= m["chg1"] <= 150
-        and m["chg5"] >= -1
-        and m["vol_pace"] >= 0.8
-        and m["buy_ratio5"] >= 0.45
-    )
+    if not (3 <= m["chg1"] <= 150) or m["chg5"] < -1 or m["buy_ratio5"] < 0.45:
+        return False
+    if m["vol_pace"] >= 0.8:                 # فوليوم متسارع
+        return True
+    # اندفاع سعري حديث بسيطرة واضحة للمشترين حتى لو تباطأ فوليوم آخر 5 دقائق عن متوسط الساعة
+    return m["chg5"] >= 5 and m["buy_ratio5"] >= 0.55 and m["vol5"] > 0
 
 
 def hold_ok(m: dict) -> bool:
@@ -1075,6 +1091,20 @@ def compute_alt_plan(kind: str, m: dict, candles: list) -> ScalpPlan:
     )
 
 
+def market_flags(m: dict) -> list:
+    """عملة صغيرة/حديثة: تُقبل لكن بتحذير (فرصتها أكبر ومخاطرتها أعلى)."""
+    f = []
+    if m["liq"] < FLAG_LIQ_USD:
+        f.append(f"سيولة منخفضة {fmt_usd(m['liq'])} — خطر انزلاق")
+    if m["mcap"] < FLAG_MCAP_USD:
+        f.append(f"ماركت كاب صغير جداً {fmt_usd(m['mcap'])}")
+    if m["age_min"] is not None and m["age_min"] < FLAG_AGE_MIN:
+        f.append(f"زوج حديث جداً ({m['age_min']:.0f} دقيقة)")
+    if m["vol1"] > 0 and m["vol_pace"] < 0.8:
+        f.append(f"فوليوم 5د ×{m['vol_pace']:.1f} من متوسط الساعة — الزخم قد يكون منتهياً")
+    return f
+
+
 def compute_score(m: dict, sec: Security, plan: ScalpPlan):
     """Score /100 = سيولة/MC (20) + فوليوم (20) + زخم (10) + جودة الدخول (25) + أمان (25) − عقوبة مخاطرة."""
     b: dict = {}
@@ -1112,6 +1142,7 @@ def compute_score(m: dict, sec: Security, plan: ScalpPlan):
         safety += 5
     b["safety"] = safety
     b["risk_penalty"] = -RISK_PENALTY if sec.warnings else 0.0
+    b["market_risk"] = -min(10, MARKET_FLAG_PENALTY * len(market_flags(m)))
 
     total = int(round(sum(b.values())))
     return int(clamp(total, 0, 100)), b
@@ -1144,7 +1175,7 @@ class ScanResult:
 
 
 def grade_of(c: Candidate) -> str:
-    if not c.sec.warnings and c.score >= MIN_SCORE:
+    if not c.sec.warnings and not market_flags(c.m) and c.score >= MIN_SCORE:
         return "🟢 قوية"
     if c.score >= RISKY_MIN_SCORE:
         return "🟡 متوسطة"
@@ -1273,7 +1304,7 @@ async def run_scan(
 
         async def get_candles(m: dict) -> list:
             async with csem:
-                c = await fetch_candles(client, m["pair"])
+                c = await fetch_candles(client, m["pair"], candle_tf(m["age_min"]))
                 await asyncio.sleep(0.6)
                 return c
 
@@ -1293,12 +1324,15 @@ async def run_scan(
         plans = []
         scalp_reason = None
         if candles:
-            plan, reject = compute_scalp_plan(candles, m["price"])
+            tf = candle_tf(m["age_min"])
+            plan, reject = compute_scalp_plan(candles, m["price"], tf)
             if plan is not None and plan.status != "WAIT":
                 plans.append(plan)
             elif reject:
                 res.stats[reject] += 1
                 scalp_reason = reject
+                if reject.startswith("شموع غير كافية"):
+                    scalp_reason = f"{reject} ({len(candles)}/{fib_params(tf)[0]} شمعة {tf}د)"
             else:
                 scalp_reason = "السعر بعيد فوق المنطقة الذهبية (انتظر تصحيحاً)"
         if momentum_ok(m):
@@ -1323,7 +1357,8 @@ async def run_scan(
     for c in ranked:
         v = res.verdicts.get(c.m["mint"])
         if v is None or v["icon"] != "✅":
-            set_v(c.m, "✅", f"Score {c.score} — {KIND_SHORT[c.plan.kind]} ({grade_of(c)})")
+            fl = market_flags(c.m)
+            set_v(c.m, "✅", f"Score {c.score} — {KIND_SHORT[c.plan.kind]} ({grade_of(c)})" + (" ⚠️ " + "، ".join(fl) if fl else ""))
     res.finished_at = time.time()
     return res
 
@@ -1352,11 +1387,15 @@ def format_best(c: Candidate, alts: list) -> str:
         f"📊 التقييم: <b>{c.score}/100</b>\n\n"
     )
     warn_block = ""
-    if risky:
-        warn_block = (
-            "🚨 <b>تحذيرات:</b> " + " • ".join(html.escape(w) for w in s.warnings) + "\n"
-            "<i>اجتازت الحظر الصلب (Mint/Freeze/LP/Danger) لكنها ليست نظيفة — حجم صغير جداً.</i>\n\n"
+    flags = market_flags(m)
+    if risky or flags:
+        items = list(s.warnings) + flags
+        note = (
+            "اجتازت الحظر الصلب (Mint/Freeze/LP/Danger) لكنها ليست نظيفة — حجم صغير جداً."
+            if risky
+            else "اجتازت الحظر الصلب، لكنها صغيرة/حديثة: فرصة أكبر ومخاطرة أعلى — قلّل حجم الصفقة."
         )
+        warn_block = "🚨 <b>تحذيرات:</b> " + " • ".join(html.escape(w) for w in items) + f"\n<i>{note}</i>\n\n"
 
     ident = (
         f"🪙 <b>{name}</b> (${sym})\n"
@@ -1411,7 +1450,8 @@ def format_best(c: Candidate, alts: list) -> str:
     breakdown = (
         f"<i>سيولة/MC {b['liq_mcap']:.0f}/20 • فوليوم {b['volume']:.0f}/20 • زخم {b['momentum']:.0f}/10 "
         f"• دخول {b['fib']:.0f}/25 • أمان {b['safety']:.0f}/25"
-        f"{' • عقوبة −' + str(RISK_PENALTY) if risky else ''}</i>\n"
+        f"{' • عقوبة −' + str(RISK_PENALTY) if risky else ''}"
+        f"{' • عقوبة سوق −' + str(int(-b.get('market_risk', 0))) if b.get('market_risk') else ''}</i>\n"
     )
     links = (
         f"🔗 <a href=\"https://dexscreener.com/solana/{m['pair']}\">DexScreener</a> • "
@@ -1518,12 +1558,13 @@ HELP = (
     f"تبقى العقود {MANUAL_TTL_HOURS:.0f} ساعة أو حتى /clear.\n\n"
     f"📡 <b>المصدر</b>: عقود آخر رسائل @{SIGNAL_CHANNEL} فقط (آخر {SIGNAL_MAX_AGE_HOURS:.0f} ساعة) — لا مسح عشوائي للسوق.\n\n"
     "📋 بعد كل /best تصلك رسالة «تقرير كل عقد» بسبب قبول/رفض كل عملة بالأرقام.\n\n"
+    f"🔎 <b>فلتر أولي</b>: سيولة ≥ {fmt_usd(MIN_LIQUIDITY_USD)} • MC ≥ {fmt_usd(MIN_MCAP_USD)} • عمر ≥ {MIN_PAIR_AGE_MIN:.0f}د — وما دون {fmt_usd(FLAG_LIQ_USD)} سيولة أو {FLAG_AGE_MIN:.0f}د عمر يُقبل بتحذير وعقوبة.\n\n"
     "🛡️ <b>حظر صلب دائماً</b>: Mint/Freeze ملغاتان • LP محروقة/مقفولة • ليست Rugged • لا Danger في RugCheck.\n\n"
     f"🧼 <b>المستوى A (نظيف)</b>: Dev ≤ {MAX_DEV_PCT:.0f}% • Top10 ≤ {MAX_TOP10_PCT:.0f}% • بلا Bundled/Insider • RugCheck Good.\n"
     "⚠️ <b>المستوى B</b>: يظهر مع تحذيرات صريحة وعقوبة في التقييم.\n\n"
     "<b>الأنواع</b>\n"
     "⚡ سكالبيج: دخول من Golden Zone، TP +18%/+25%\n"
-    "🚀 زخم: صعود بفوليوم متسارع، TP +15%/+30%\n"
+    "🚀 زخم: صعود بفوليوم متسارع أو اندفاع سعري بسيطرة مشترين، TP +15%/+30%\n"
     "🧭 احتفاظ: عملة 24h+ بسيولة وفوليوم جيدين، TP +50%/+100%\n\n"
     f"🟢 قوية: A وScore ≥ {MIN_SCORE:.0f} • 🟡 متوسطة: ≥ {RISKY_MIN_SCORE:.0f} • 🟠 ضعيفة: أقل."
 )
@@ -1532,7 +1573,7 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/3.5", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/3.6", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -1852,7 +1893,7 @@ async def run_all() -> None:
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
-    log.info("SolAlpha Sniper v3.5 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v3.6 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
