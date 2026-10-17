@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v3.7 — Telegram bot (Render Web Service)
+SolAlpha Sniper v3.9 — Telegram bot (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -30,6 +30,7 @@ SolAlpha Sniper v3.7 — Telegram bot (Render Web Service)
 
 import asyncio
 import html
+import io
 import json
 import logging
 import math
@@ -275,6 +276,7 @@ class Signal:
     is_hint: bool = False           # جاء من رابط DexScreener (قد يكون عنوان زوج)
     manual: bool = False            # أرسله المستخدم يدوياً (لصق/Forward)
     added: float = 0.0              # وقت استلام البوت له (للوضع اليدوي)
+    done: bool = False              # حُلِّل سابقاً (لا يُعاد تحليله إلا بـ /best all)
 
 
 def is_valid_solana_address(s: str) -> bool:
@@ -958,11 +960,11 @@ def fib_params(tf: int):
     return (25, 120, 60) if tf == 1 else (MIN_CANDLES, MAX_WINDOW_CANDLES, SWING_LOOKBACK_CANDLES)
 
 
-async def fetch_candles(client: httpx.AsyncClient, pool: str, tf: int = 5) -> list:
+async def fetch_candles(client: httpx.AsyncClient, pool: str, tf: int = 5, limit: Optional[int] = None) -> list:
     data = await fetch_json(
         client,
         f"{GECKO}/networks/solana/pools/{pool}/ohlcv/minute",
-        params={"aggregate": tf, "limit": 200 if tf == 1 else 100, "currency": "usd"},
+        params={"aggregate": tf, "limit": limit or (200 if tf == 1 else 100), "currency": "usd"},
     )
     rows = (((data or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") if isinstance(data, dict) else None
     candles = []
@@ -1170,6 +1172,7 @@ class ScanResult:
     discovered: int = 0
     verdicts: dict = field(default_factory=dict)   # mint -> {sym, mcap, icon, text}
     watch: list = field(default_factory=list)      # (m, sec|None, kind) → قائمة المراقبة
+    secs: dict = field(default_factory=dict)       # mint -> Security (لتسجيل الصفقات)
     unresolved: list = field(default_factory=list)  # عقود بلا بيانات سوق
     after_prefilter: int = 0
     after_security: int = 0
@@ -1205,7 +1208,9 @@ async def run_scan(
     res = ScanResult()
 
     def set_v(m: dict, icon: str, text: str) -> None:
-        res.verdicts[m["mint"]] = {"sym": m["symbol"], "mcap": m["mcap"], "icon": icon, "text": text}
+        snap = {k: m.get(k) for k in ("price", "mcap", "liq", "age_min", "chg5", "chg1", "vol_pace",
+                                      "buy_ratio5", "vol1", "pair", "dex", "symbol")}
+        res.verdicts[m["mint"]] = {"sym": m["symbol"], "mcap": m["mcap"], "icon": icon, "text": text, "m": snap}
 
     # 1) قراءة القناة
     await say(f"📡 (1/4) قراءة آخر إشارات قناة @{SIGNAL_CHANNEL} ...")
@@ -1294,6 +1299,8 @@ async def run_scan(
                 set_v(task_map[t], "⚠️", "خطأ أثناء فحص RugCheck — ليس حكماً على العملة")
                 continue
             m, sec = t.result()
+            if sec is not None:
+                res.secs[m['mint']] = sec
             if sec is None:
                 res.stats["تعذر جلب تقرير RugCheck"] += 1
                 set_v(m, "⚠️", "تعذر جلب تقرير RugCheck (حد طلبات/غير مفهرسة) — ليس حكماً على العملة")
@@ -1563,7 +1570,9 @@ WELCOME = (
     "• /best — أفضل صفقة من إشارات القناة + بدائل\n"
     "• أرسل لي عقداً (أو حوّل رسالة إشارة من القناة) ثم /best لتحليله\n"
     "• /clear — مسح العقود التي أرسلتها\n"
+    "• /best يحلل العقود الجديدة فقط؛ السابقة تبقى تحت المراقبة دون إعادة تحليل (/best all لإعادة تحليل الكل)\n"
     "• /watchlist — العملات تحت المراقبة • /unwatch — مسحها\n"
+    "• /report — تقرير نتائج الصفقات (آخر 24 ساعة) مع أسباب الفشل وملف تفاصيل\n"
     "• /diag — تشخيص قراءة القناة (Telethon)\n"
     "• /help — شرح الأنواع والفلاتر\n\n"
     "⚠️ أداة تحليل وليست نصيحة مالية."
@@ -1591,13 +1600,14 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/3.7", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/3.9", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
     application.bot_data["cooldowns"] = {}
     application.bot_data["last_scan"] = None
     application.bot_data["watch"] = load_watch()
+    application.bot_data["track"] = load_track()
     TL["client"], TL["error"] = await create_telethon()
 
 
@@ -1962,6 +1972,7 @@ async def watch_cycle(app: Application) -> None:
             it["alerted"] = (it["alerted"] + [setup["key"]])[-10:]
             it["setup"] = setup
             await notify(app, it, format_bounce_alert(it, m, setup))
+            record_bounce(bd, it, m, setup)
         await asyncio.sleep(0.5)
     save_watch(bd)
 
@@ -1975,6 +1986,12 @@ async def watch_loop(app: Application) -> None:
             raise
         except Exception:
             log.exception("watch cycle failed")
+        try:
+            await tracker_cycle(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("tracker cycle failed")
         await asyncio.sleep(WATCH_INTERVAL_SEC)
 
 
@@ -2011,6 +2028,475 @@ async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         store.pop(k, None)
     save_watch(bd)
     await update.effective_message.reply_text(f"🧹 أُزيلت {len(keys)} عملة من المراقبة.")
+
+
+# ───────────────────────────── تتبع نتائج الصفقات + تقرير /report ─────────────────────────────
+TRACK_FILE = os.getenv("TRACK_FILE", "tracker.json")
+TRACK_WINDOW_HOURS = _env_float("TRACK_WINDOW_HOURS", 24)     # مدة تتبع كل سجل بعد الإشارة
+TRACK_KEEP_HOURS = 48                                          # أطول مدة نحتفظ فيها بالسجلات
+REPORT_MAX_SETTLE = int(_env_float("REPORT_MAX_SETTLE", 40))   # أقصى عدد سجلات تُحسم بالشموع في التقرير
+
+KEY_LABEL = {
+    "chase": "مطاردة بعد صعود قوي", "pace": "فوليوم يتباطأ", "sell": "ضغط بيع", "liq": "سيولة ضعيفة",
+    "young": "عملة حديثة جداً", "top10": "تركّز كبار الملاك", "fast": "سقوط سريع بعد الدخول",
+    "tight": "وقف ضيق", "flat": "لم تتحرك للأعلى أبداً", "almost": "قريبة من الهدف ثم انعكست",
+    "amb": "وقف وهدف في الدقيقة نفسها", "unknown": "بلا مؤشر واضح",
+}
+KIND_LABEL = {"SCALP": "⚡سكالبيج", "MOMENTUM": "🚀زخم", "HOLD": "🧭احتفاظ", "BOUNCE": "🔔ارتداد", "-": "—"}
+DECISION_LABEL = {"main": "رئيسية", "alt": "بديل", "other": "مرتّبة", "bounce": "ارتداد", "watch": "مراقبة", "rej": "مرفوضة"}
+
+
+def save_track(bd: dict) -> None:
+    try:
+        tmp = TRACK_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(bd.get("track", {}).values()), f, ensure_ascii=False)
+        os.replace(tmp, TRACK_FILE)
+    except Exception as e:
+        log.warning("save_track failed: %s", e)
+
+
+def load_track() -> dict:
+    try:
+        with open(TRACK_FILE, encoding="utf-8") as f:
+            return {r["id"]: r for r in json.load(f)}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning("load_track failed: %s", e)
+        return {}
+
+
+def _feat(m: dict, sec: Optional["Security"] = None) -> dict:
+    f = {
+        "mcap": m.get("mcap"), "liq": m.get("liq"), "age_min": m.get("age_min"), "chg5": m.get("chg5"),
+        "chg1": m.get("chg1"), "vol_pace": m.get("vol_pace"), "buy5": m.get("buy_ratio5"),
+        "vol1": m.get("vol1"), "dex": m.get("dex"),
+    }
+    try:
+        f["flags"] = market_flags(m)
+    except Exception:
+        f["flags"] = []
+    if sec is not None:
+        f.update({"top10": sec.top10, "dev": sec.dev, "lp": sec.lp_locked, "rug": sec.rug_norm})
+    return f
+
+
+def _new_rec(uid: int, chat_id: int, m: dict, decision: str, kind: str = "-", score=None, grade: str = "",
+             text: str = "", plan: Optional["ScalpPlan"] = None, sec: Optional["Security"] = None) -> dict:
+    ts, price = time.time(), m["price"]
+    rec = {
+        "id": f"{uid}:{m['mint']}:{decision}:{int(ts)}", "uid": uid, "chat": chat_id, "mint": m["mint"],
+        "pair": m.get("pair"), "sym": m.get("symbol") or m["mint"][:5], "ts": ts, "decision": decision,
+        "kind": kind, "score": score, "grade": grade, "text": text, "price0": price,
+        "entry": None, "sl": None, "tp1": None, "tp2": None, "risk_pct": None, "zone_high": None,
+        "f": _feat(m, sec), "last": price, "last_ts": ts, "hi": price, "lo": price, "t_hi": None, "t_lo": None,
+        "first": None, "t_first": None, "hit2": False, "entered0": True, "entered": True, "t_enter": None,
+        "closed": False,
+    }
+    if plan is not None:
+        rec.update(entry=plan.entry, sl=plan.sl, tp1=plan.tp1, tp2=plan.tp2, risk_pct=plan.risk_pct,
+                   zone_high=plan.zone_high)
+        rec["entered0"] = rec["entered"] = not (plan.kind == "SCALP" and plan.status == "ABOVE_ZONE")
+    return rec
+
+
+def _dup(store: dict, uid: int, mint: str, decision: str, window_sec: float) -> bool:
+    now = time.time()
+    return any(r["uid"] == uid and r["mint"] == mint and r["decision"] == decision and now - r["ts"] < window_sec
+               for r in store.values())
+
+
+def record_scan(bd: dict, uid: int, chat_id: int, res: "ScanResult") -> int:
+    """يسجّل كل ما حلّله /best: الرئيسية والبدائل والمرفوضة والمراقَبة، لقياس نتائجها لاحقاً."""
+    store = bd.setdefault("track", {})
+    seen: dict = {}
+    for c in res.ranked:
+        seen.setdefault(c.m["mint"], c)
+    n = 0
+    for i, c in enumerate(seen.values()):
+        decision = "main" if i == 0 else ("alt" if i <= 2 else "other")
+        if _dup(store, uid, c.m["mint"], decision, 3 * 3600):
+            continue
+        rec = _new_rec(uid, chat_id, c.m, decision, c.plan.kind, c.score, grade_of(c),
+                       "، ".join(market_flags(c.m)), c.plan, c.sec)
+        store[rec["id"]] = rec
+        n += 1
+    for mint, v in res.verdicts.items():
+        m = v.get("m")
+        if mint in seen or not m or (m.get("price") or 0) <= 0:
+            continue
+        decision = "watch" if v["icon"] == "👁" else "rej"
+        if _dup(store, uid, mint, decision, 3 * 3600):
+            continue
+        rec = _new_rec(uid, chat_id, {**m, "mint": mint}, decision, "-", None, "", f"{v['icon']} {v['text']}",
+                       None, res.secs.get(mint))
+        store[rec["id"]] = rec
+        n += 1
+    if n:
+        save_track(bd)
+    return n
+
+
+def record_bounce(bd: dict, it: dict, m: dict, s: dict) -> None:
+    store = bd.setdefault("track", {})
+    if _dup(store, it["uid"], it["mint"], "bounce", 1800):
+        return
+    rec = _new_rec(it["uid"], it["chat"], m, "bounce", "BOUNCE", None, "★" * s["stars"],
+                   f"ارتداد +{s['bounce']:.0f}% من القاع بعد تصحيح {s['retr']:.0%}")
+    rec.update(entry=s["entry"], sl=s["sl"], tp1=s["tp1"], tp2=s["tp2"], risk_pct=s["risk_pct"])
+    rec["f"]["sec_txt"] = it.get("sec_txt", "")
+    store[rec["id"]] = rec
+    save_track(bd)
+
+
+def track_update(r: dict, price: float, now: float) -> None:
+    r["last"], r["last_ts"] = price, now
+    if price > r["hi"]:
+        r["hi"], r["t_hi"] = price, now
+    if price < r["lo"]:
+        r["lo"], r["t_lo"] = price, now
+    if r["sl"] is None:
+        return
+    if not r["entered"]:
+        if r["zone_high"] and price <= r["zone_high"]:
+            r["entered"], r["t_enter"] = True, now
+            r["hi"] = r["lo"] = price
+        return
+    if r["first"] is None:
+        if price <= r["sl"]:
+            r["first"], r["t_first"] = "SL", now
+        elif price >= r["tp1"]:
+            r["first"], r["t_first"] = "TP1", now
+    if r["first"] == "TP1" and price >= r["tp2"]:
+        r["hit2"] = True
+
+
+async def tracker_cycle(app: Application) -> None:
+    bd = app.bot_data
+    store: dict = bd.get("track") or {}
+    if not store:
+        return
+    now = time.time()
+    for k, r in list(store.items()):
+        if now - r["ts"] > TRACK_KEEP_HOURS * 3600:
+            store.pop(k, None)
+        elif not r["closed"] and now - r["ts"] > TRACK_WINDOW_HOURS * 3600:
+            r["closed"] = True
+    active = [r for r in store.values() if not r["closed"]]
+    if not active:
+        return
+    sink: dict = {}
+    try:
+        await asyncio.wait_for(fetch_pairs(bd["http"], list({r["mint"] for r in active}), (), sink), timeout=40)
+    except asyncio.TimeoutError:
+        pass
+    metrics = {}
+    for p in sink.values():
+        mm = extract_metrics(p)
+        if mm:
+            metrics[mm["mint"]] = mm
+    for r in active:
+        mm = metrics.get(r["mint"])
+        if mm and mm["price"] > 0:
+            r["pair"] = mm["pair"]
+            track_update(r, mm["price"], now)
+    save_track(bd)
+
+
+def _settle_poll(r: dict) -> dict:
+    p0 = r["price0"] or 1e-18
+    if r["sl"] is None:
+        return {"src": "poll", "max": r["hi"] / p0 - 1, "min": r["lo"] / p0 - 1, "end": r["last"] / p0 - 1}
+    e = r["entry"] or p0
+    if not r["entered"]:
+        return {"src": "poll", "entered": False, "max": r["hi"] / p0 - 1, "end": r["last"] / p0 - 1}
+    return {"src": "poll", "entered": True, "first": r["first"], "hit2": r["hit2"], "amb": False,
+            "mfe": r["hi"] / e - 1, "mae": r["lo"] / e - 1, "max_after": r["hi"] / e - 1,
+            "mins": ((r["t_first"] - r["ts"]) / 60) if r["t_first"] else None, "end": r["last"] / e - 1}
+
+
+def _settle_candles(r: dict, candles: list) -> Optional[dict]:
+    """يحسم نتيجة السجل من شموع 1د بعد وقت الإشارة. ضرب الوقف والهدف في نفس الدقيقة يُحسب خسارة (تحفظاً)."""
+    cs = [c for c in candles if c[0] >= r["ts"]]   # شموع تبدأ بعد لحظة الإشارة
+    if len(cs) < 2:
+        return None
+    p0 = r["price0"] or 1e-18
+    hi_all = max(c[2] for c in cs)
+    if r["sl"] is None:
+        return {"src": "candles", "max": hi_all / p0 - 1, "min": min(c[3] for c in cs) / p0 - 1, "end": cs[-1][4] / p0 - 1}
+    entry, sl, tp1, tp2 = r["entry"] or p0, r["sl"], r["tp1"], r["tp2"]
+    start = 0
+    if not r["entered0"]:
+        start = next((i for i, c in enumerate(cs) if r["zone_high"] and c[3] <= r["zone_high"]), None)
+        if start is None:
+            return {"src": "candles", "entered": False, "max": hi_all / p0 - 1, "end": cs[-1][4] / p0 - 1}
+    first, t_first, amb, hit2 = None, None, False, False
+    hi_b = lo_b = hi_a = entry
+    for c in cs[start:]:
+        h, lo = c[2], c[3]
+        hi_a = max(hi_a, h)
+        if first is None:
+            hi_b, lo_b = max(hi_b, h), min(lo_b, lo)
+            sl_hit, tp_hit = lo <= sl, h >= tp1
+            if sl_hit:
+                first, amb = "SL", tp_hit
+            elif tp_hit:
+                first = "TP1"
+            if first:
+                t_first = c[0]
+        if first == "TP1" and h >= tp2:
+            hit2 = True
+    return {"src": "candles", "entered": True, "first": first, "hit2": hit2, "amb": amb,
+            "mfe": hi_b / entry - 1, "mae": lo_b / entry - 1, "max_after": hi_a / entry - 1,
+            "mins": ((t_first - r["ts"]) / 60) if t_first else None, "end": cs[-1][4] / entry - 1}
+
+
+async def settle_all(client: httpx.AsyncClient, recs: list, status=None) -> list:
+    """يرجع [(rec, result)] مع حسم الأهم بالشموع (حد REPORT_MAX_SETTLE) والباقي من لقطات التتبع."""
+    now = time.time()
+    prio = sorted(recs, key=lambda r: (0 if r["sl"] is not None else 1, -r["ts"]))
+    use_candles = {r["id"] for r in prio[:REPORT_MAX_SETTLE] if r.get("pair") and now - r["ts"] < 16 * 3600}
+    out = []
+    done = 0
+    for r in recs:
+        res = None
+        if r["id"] in use_candles:
+            try:
+                res = _settle_candles(r, await fetch_candles(client, r["pair"], 1, 1000))
+            except Exception:
+                log.exception("settle candles failed")
+            await asyncio.sleep(0.4)
+            done += 1
+            if status is not None and done % 8 == 0:
+                try:
+                    await status.edit_text(f"📊 جارٍ حساب النتائج من الشموع ({done}/{len(use_candles)})...")
+                except Exception:
+                    pass
+        out.append((r, res or _settle_poll(r)))
+    return out
+
+
+def _fail_reasons(r: dict, x: dict) -> list:
+    f = r.get("f") or {}
+    out = []
+    if (f.get("chg1") or 0) >= 60:
+        out.append(("chase", f"مطاردة: دخلت بعد صعود 1h {f['chg1']:+.0f}%"))
+    if f.get("vol_pace") is not None and f["vol_pace"] < 0.8:
+        out.append(("pace", f"فوليوم يتباطأ ×{f['vol_pace']:.1f}"))
+    if f.get("buy5") is not None and f["buy5"] < 0.5:
+        out.append(("sell", f"ضغط بيع (شراء {f['buy5'] * 100:.0f}%)"))
+    if (f.get("liq") or 1e12) < 15000:
+        out.append(("liq", f"سيولة ضعيفة {fmt_usd(f['liq'])}"))
+    if f.get("age_min") is not None and f["age_min"] < 45:
+        out.append(("young", f"حديثة جداً ({f['age_min']:.0f}د)"))
+    if (f.get("top10") or 0) >= 35:
+        out.append(("top10", f"تركّز Top10 {f['top10']:.0f}%"))
+    mins = x.get("mins")
+    if mins is not None and mins <= 8:
+        out.append(("fast", f"سقطت بسرعة ({mins:.0f}د)"))
+    if r.get("risk_pct") and r["risk_pct"] < 8 and mins is not None and mins <= 15:
+        out.append(("tight", f"وقف ضيق (−{r['risk_pct']:.0f}%) مقابل تذبذب العملة"))
+    mfe = x.get("mfe") or 0
+    tp_dist = (r["tp1"] / r["entry"] - 1) if r.get("tp1") and r.get("entry") else 0
+    if mfe < 0.03:
+        out.append(("flat", "لم تتحرك للأعلى قبل الوقف"))
+    elif tp_dist > 0 and mfe / tp_dist >= 0.6:
+        out.append(("almost", f"وصلت {mfe / tp_dist:.0%} من الهدف الأول ثم انعكست"))
+    if x.get("amb"):
+        out.append(("amb", "ضُرب الوقف والهدف في الدقيقة نفسها (حُسبت خسارة)"))
+    return out or [("unknown", "لا مؤشر واضح — راجع الرسم يدوياً")]
+
+
+def _outcome(r: dict, x: dict) -> str:
+    if x.get("entered") is False:
+        return "noentry"
+    if x.get("first") == "TP1":
+        return "win"
+    if x.get("first") == "SL":
+        return "loss"
+    return "open"
+
+
+def _reason_key(text: str) -> str:
+    return " ".join(re.sub(r"[\d.$%+\-—()\[\]•/:،]+|[KM]\b", " ", text).split()[:4])
+
+
+def _mean(vals: list) -> Optional[float]:
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def build_report(settled: list, hours: float):
+    """يرجع (قائمة رسائل HTML، بيانات JSON bytes)."""
+    trades = [(r, x) for r, x in settled if r["sl"] is not None]
+    others = [(r, x) for r, x in settled if r["sl"] is None]
+    cls = [(r, x, _outcome(r, x)) for r, x in trades]
+    wins = [t for t in cls if t[2] == "win"]
+    losses = [t for t in cls if t[2] == "loss"]
+    opens = [t for t in cls if t[2] == "open"]
+    noent = [t for t in cls if t[2] == "noentry"]
+    resolved = len(wins) + len(losses)
+
+    def row(items: list) -> str:
+        w = sum(1 for t in items if t[2] == "win")
+        l = sum(1 for t in items if t[2] == "loss")
+        o = len(items) - w - l
+        return f"✅{w} ❌{l} ⏳{o}" + (f" ({w / (w + l):.0%})" if w + l else "")
+
+    msgs = []
+    head = [f"📊 <b>تقرير آخر {hours:.0f} ساعة</b>", ""]
+    if not trades:
+        head.append("لا توجد صفقات بخطة دخول/هدف/وقف في هذه الفترة.")
+    else:
+        head += [
+            f"الصفقات التي أعطاها البوت: <b>{len(trades)}</b>",
+            f"✅ نجحت (TP1 قبل الوقف): <b>{len(wins)}</b> • ❌ فشلت (وقف): <b>{len(losses)}</b> • "
+            f"⏳ مفتوحة: {len(opens)} • لم تدخل المنطقة: {len(noent)}",
+        ]
+        if resolved:
+            head.append(f"🎯 <b>نسبة النجاح من المحسومة: {len(wins) / resolved:.0%}</b> ({len(wins)}/{resolved})")
+        t2 = sum(1 for t in wins if t[1].get("hit2"))
+        if wins:
+            head.append(f"TP2 تحقق أيضاً في {t2} من {len(wins)} ناجحة")
+        mfe = _mean([t[1].get("mfe") for t in cls if t[2] != "noentry"])
+        mae = _mean([t[1].get("mae") for t in cls if t[2] != "noentry"])
+        if mfe is not None and mae is not None:
+            head.append(f"متوسط أقصى ربح قبل الحسم {mfe * 100:+.0f}% • متوسط أقصى هبوط {mae * 100:+.0f}%")
+        mains = [t for t in cls if t[0]["decision"] == "main"]
+        if mains:
+            head.append(f"الرئيسية فقط: {row(mains)}")
+        head += ["", "<b>حسب النوع:</b>"]
+        for k in ("SCALP", "MOMENTUM", "HOLD", "BOUNCE"):
+            sub = [t for t in cls if t[0]["kind"] == k]
+            if sub:
+                head.append(f"• {KIND_LABEL[k]}: {row(sub)}")
+        scored = [t for t in cls if t[0].get("score") is not None]
+        if scored:
+            head += ["", "<b>حسب التقييم:</b>"]
+            for lo_, hi_, lab in ((75, 101, "≥75"), (65, 75, "65–74"), (0, 65, "<65")):
+                sub = [t for t in scored if lo_ <= t[0]["score"] < hi_]
+                if sub:
+                    head.append(f"• {lab}: {row(sub)}")
+        flagged = [t for t in cls if (t[0].get("f") or {}).get("flags")]
+        clean = [t for t in cls if not (t[0].get("f") or {}).get("flags")]
+        head += ["", "<b>حسب التحذيرات:</b>", f"• بلا تحذيرات: {row(clean)}", f"• مع تحذيرات: {row(flagged)}"]
+    msgs.append("\n".join(head))
+
+    if trades:
+        lines = ["📋 <b>تفاصيل الصفقات</b>", ""]
+        for r, x, c in sorted(cls, key=lambda t: t[0]["ts"])[:25]:
+            lab = f"{KIND_LABEL.get(r['kind'], r['kind'])}{' ' + str(r['score']) if r.get('score') is not None else ''}"
+            mfe_t = f"أقصى {x['mfe'] * 100:+.0f}% / هبوط {x['mae'] * 100:+.0f}%" if x.get("mfe") is not None else ""
+            if c == "win":
+                line = f"✅ <b>{html.escape(r['sym'])}</b> {lab} — TP1 بعد {x.get('mins') or 0:.0f}د" + (" • TP2 ✓" if x.get("hit2") else "") + f" | {mfe_t}"
+            elif c == "loss":
+                line = f"❌ <b>{html.escape(r['sym'])}</b> {lab} — وقف بعد {x.get('mins') or 0:.0f}د | {mfe_t}"
+                line += "\n   ↳ " + " • ".join(t for _, t in _fail_reasons(r, x)[:3])
+            elif c == "open":
+                line = f"⏳ <b>{html.escape(r['sym'])}</b> {lab} — لم تُحسم (الآن {x.get('end', 0) * 100:+.0f}%) | {mfe_t}"
+            else:
+                line = f"💤 <b>{html.escape(r['sym'])}</b> {lab} — لم تنزل لمنطقة الدخول (أقصى {x.get('max', 0) * 100:+.0f}%)"
+            lines.append(line)
+        if len(cls) > 25:
+            lines.append(f"… و{len(cls) - 25} أخرى (التفاصيل الكاملة في ملف JSON)")
+        msgs.append("\n".join(lines))
+
+    if losses:
+        cnt: Counter = Counter()
+        for r, x, _ in losses:
+            for k, _t in _fail_reasons(r, x):
+                cnt[k] += 1
+        diag = ["🔍 <b>تشخيص الفاشلة</b>", "", "أكثر الأسباب المحتملة تكراراً:"]
+        for k, n in cnt.most_common(6):
+            diag.append(f"• {KEY_LABEL.get(k, k)}: {n} من {len(losses)}")
+        if wins:
+            diag += ["", "<b>الناجحة مقابل الفاشلة (متوسطات عند الإشارة):</b>"]
+            for name, fn, fmt in (
+                ("التقييم", lambda r: r.get("score"), "{:.0f}"),
+                ("وتيرة الفوليوم", lambda r: r["f"].get("vol_pace"), "×{:.1f}"),
+                ("ضغط الشراء 5د", lambda r: (r["f"].get("buy5") or 0) * 100 if r["f"].get("buy5") is not None else None, "{:.0f}%"),
+                ("صعود 1h", lambda r: r["f"].get("chg1"), "{:+.0f}%"),
+                ("عمر الزوج (د)", lambda r: r["f"].get("age_min"), "{:.0f}"),
+                ("Top10", lambda r: r["f"].get("top10"), "{:.0f}%"),
+            ):
+                a, b = _mean([fn(t[0]) for t in wins]), _mean([fn(t[0]) for t in losses])
+                if a is not None and b is not None:
+                    diag.append(f"• {name}: ناجحة {fmt.format(a)} ← فاشلة {fmt.format(b)}")
+        msgs.append("\n".join(diag))
+
+    if others:
+        big = sorted(((r, x) for r, x in others), key=lambda t: -(t[1].get("max") or 0))
+        missed = [t for t in big if (t[1].get("max") or 0) >= 1.0]
+        mid = [t for t in big if 0.3 <= (t[1].get("max") or 0) < 1.0]
+        fine = [t for t in big if (t[1].get("max") or 0) < 0.3]
+        rl = [f"🕵️ <b>العملات التي لم يوصِ بها ({len(others)})</b>", "",
+              f"• ركضت ≥+100% بعد تقييمها: <b>{len(missed)}</b> • +30–100%: {len(mid)} • أقل من +30% (قرار سليم): {len(fine)}"]
+        if missed:
+            rl += ["", "<b>الفرص التي فاتت (وسبب الرفض):</b>"]
+            for r, x in missed[:8]:
+                rl.append(f"• <b>{html.escape(r['sym'])}</b> {x['max'] * 100:+.0f}% (MC عند التقييم {fmt_usd(r['f'].get('mcap') or 0)}) — {html.escape(r['text'][:70])}")
+            keys = Counter(_reason_key(r["text"]) for r, _ in missed)
+            rl += ["", "<b>أكثر قاعدة فوّتت فرصاً:</b>"] + [f"• {k}: {n}" for k, n in keys.most_common(4)]
+        msgs.append("\n".join(rl))
+
+    foot = ("ℹ️ النتائج تقريبية: حُسمت من شموع 1د حيثما توفرت وإلا من لقطات كل 45 ثانية. "
+            "الوقف والهدف في الدقيقة نفسها يُحسبان خسارة. العينة صغيرة — لا تبنِ قراراً على يوم واحد.")
+    msgs.append(foot)
+
+    data = []
+    for r, x in settled:
+        d = {k: v for k, v in r.items() if k not in ("chat",)}
+        d["result"] = x
+        if r["sl"] is not None and _outcome(r, x) == "loss":
+            d["fail_reasons"] = [t for _, t in _fail_reasons(r, x)]
+        data.append(d)
+    return msgs, json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    bd = context.application.bot_data
+    uid = update.effective_user.id
+    hours = 24.0
+    if context.args:
+        try:
+            hours = max(1.0, min(48.0, float(context.args[0])))
+        except ValueError:
+            pass
+    lock = bd.setdefault("report_lock", asyncio.Lock())
+    if lock.locked():
+        await msg.reply_text("⏳ أُعدّ تقريراً الآن، انتظر قليلاً.")
+        return
+    async with lock:
+        status = await msg.reply_text("📊 جارٍ إعداد التقرير...")
+        cutoff = time.time() - hours * 3600
+        recs = sorted((r for r in (bd.get("track") or {}).values() if r["uid"] == uid and r["ts"] >= cutoff),
+                      key=lambda r: r["ts"])
+        if not recs:
+            await status.edit_text("لا توجد صفقات مسجلة في هذه الفترة. التسجيل يبدأ تلقائياً مع كل /best وكل تنبيه ارتداد.")
+            return
+        try:
+            settled = await settle_all(bd["http"], recs, status)
+            texts, data = build_report(settled, hours)
+        except Exception:
+            log.exception("report failed")
+            await status.edit_text("❌ فشل إعداد التقرير. راجع Logs في Render.")
+            return
+        try:
+            await status.edit_text("✅ التقرير جاهز")
+        except Exception:
+            pass
+        for t in texts:
+            await safe_send(msg, t[:4000])
+        try:
+            await msg.reply_document(
+                document=io.BytesIO(data),
+                filename=f"solalpha_report_{time.strftime('%Y%m%d_%H%M')}.json",
+                caption="📎 التفاصيل الكاملة (أرسل لي هذا الملف لنحلل الخلل ونحسّن البوت).",
+            )
+        except Exception:
+            log.exception("send report file failed")
 
 
 def _manual_store(bd: dict, uid: int) -> dict:
@@ -2057,16 +2543,25 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     store = _manual_store(context.application.bot_data, user.id)
     now = time.time()
+    fresh = already = 0
     for a in mints:
+        prev = store.get(a)
+        if prev is not None and prev.done:           # حُلِّلت سابقاً وهي تحت المراقبة
+            already += 1
+            continue
         store[a] = Signal(a, post_id, ts, False, True, now)
+        fresh += 1
     for a in hints:
         if a not in store:
             store[a] = Signal(a, post_id, ts, True, True, now)
+            fresh += 1
     while len(store) > MANUAL_MAX:
         store.pop(min(store, key=lambda k: store[k].added), None)
+    pending = sum(1 for s in store.values() if not s.done)
     await msg.reply_text(
-        f"✅ استلمت {len(mints) + len(hints)} عقد. إجمالي المنتظر للتحليل: {len(store)}.\n"
-        "حوّل المزيد، أو أرسل /best للتحليل (و/clear للمسح)."
+        (f"✅ استلمت {fresh} عقد جديد." if fresh else "ℹ️ لا عقود جديدة في هذه الرسالة.")
+        + (f"\n♻️ {already} عقد محلَّل سابقاً وتحت المراقبة — لن أعيد تحليله." if already else "")
+        + f"\nبانتظار التحليل: {pending}. أرسل /best لتحليل الجديد فقط (و/best all لإعادة تحليل الكل)."
     )
 
 
@@ -2093,7 +2588,11 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     res = None
     try:
-        extras = list(_manual_store(bd, update.effective_user.id).values())
+        uid = update.effective_user.id
+        force_all = bool(context.args) and context.args[0].lower() in ("all", "الكل")
+        mstore = _manual_store(bd, uid)
+        extras = [s for s in mstore.values() if force_all or not s.done]   # الجديد فقط
+        had_done = any(s.done for s in mstore.values())
         cached = bd.get("last_scan") if not extras else None
         if cached and time.time() - cached.finished_at < SCAN_CACHE_SEC:
             res = cached
@@ -2104,7 +2603,16 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 bd["last_scan"] = res if (res.discovered > 0 and not extras) else None
 
-        if res.signals == 0:
+        if res.discovered > 0:
+            for s in extras:
+                s.done = True
+        if res.signals == 0 and had_done and not extras:
+            text = (
+                "ℹ️ لا توجد عقود جديدة منذ آخر تحليل.\n"
+                "العقود السابقة ما زالت تحت المراقبة (/watchlist) ولن أعيد تحليلها.\n"
+                "الصق عقوداً جديدة ثم /best، أو أرسل /best all لإعادة تحليل الكل."
+            )
+        elif res.signals == 0:
             text = format_no_signals(res)
         elif res.discovered == 0:
             text = (
@@ -2140,6 +2648,11 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         added = add_watch(bd, update.effective_user.id, update.effective_chat.id, res.watch)
         if added:
             await safe_send(msg, format_watch_added(added))
+    if res is not None and res.signals and res.discovered:
+        try:
+            record_scan(bd, update.effective_user.id, update.effective_chat.id, res)
+        except Exception:
+            log.exception("record_scan failed")
 
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2261,6 +2774,7 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT | filters.CAPTION), on_user_message
     ))
@@ -2273,7 +2787,7 @@ async def run_all() -> None:
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
     watcher = asyncio.create_task(watch_loop(app))
-    log.info("SolAlpha Sniper v3.7 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v3.9 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
