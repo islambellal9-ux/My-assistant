@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v4.5 — Telegram bot (Render Web Service)
+SolAlpha Sniper v4.6 — Telegram bot (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -1603,6 +1603,7 @@ WELCOME = (
 )
 
 HELP = (
+    "⏳ <b>العقود بلا بيانات</b> (جديدة جداً) لا تضيع: تبقى في /watchlist وتُفحص تلقائياً فور ظهور بياناتها.\n\n"
     "🏷️ <b>وسوم الإشارة</b>: تحذيرات بأرقام من تقاريرك (5د سالب، ساعات مسائية، هبوط متدرّج) وخروج سريع TP0. هي معلومات، لا تمنع أي إشارة.\n\n"
     "📤 <b>/export</b>: ملف شموع الدقيقة والإشارات لمعايرة كاشف الارتداد على كل عملاتك (أرسله لي).\n\n"
     "📍 <b>الدعم</b>: كل ارتداد مؤكد يُرسل لك كما هو، ويُوسم بقوة الدعم (✅ قوي / ⚠️ ضعيف) مع أقرب دعم تحته، وأنبّهك عند اقتراب السعر من دعم قوي. "
@@ -1628,7 +1629,7 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/4.5", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/4.6", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -1723,6 +1724,7 @@ WATCH_KIND_TXT = {
     "dip": "📉 هابطة — بانتظار قاع وارتداد",
     "extended": "📈 صعدت كثيراً — بانتظار تصحيح",
     "nosetup": "👁 آمنة — بانتظار ارتداد",
+    "nodata": "⏳ بلا بيانات سوق بعد (جديدة جداً) — أعيد المحاولة تلقائياً",
 }
 
 
@@ -1788,6 +1790,29 @@ def add_watch(bd: dict, uid: int, chat_id: int, entries: list) -> list:
             "added": time.time(), "sec_ok": True if sec is not None else None,
             "sec_txt": sec_brief(sec) if sec is not None else "", "setup": None, "alerted": [],
             "candle_ts": 0.0, "sec_tries": 0, "why": "",
+        }
+        added.append(store[key])
+    if added:
+        save_watch(bd)
+    return added
+
+
+def add_watch_pending(bd: dict, uid: int, chat_id: int, mints: list) -> list:
+    """عقود لا بيانات سوق لها بعد: تبقى في المراقبة وتُفحص تلقائياً فور ظهور بياناتها."""
+    store = bd.setdefault("watch", {})
+    added = []
+    for mint in mints:
+        key = f"{uid}:{mint}"
+        if key in store:
+            continue
+        mine = [k for k, it in store.items() if it["uid"] == uid]
+        if len(mine) >= WATCH_MAX_PER_USER:
+            store.pop(min(mine, key=lambda k: store[k]["added"]), None)
+        store[key] = {
+            "key": key, "uid": uid, "chat": chat_id, "mint": mint, "pair": "", "sym": mint[:4] + "…", "name": "",
+            "kind": "nodata", "mcap0": 0.0, "price0": 0.0, "price": 0.0, "mcap": 0.0, "dex": "", "factor": 0.0,
+            "added": time.time(), "sec_ok": None, "sec_txt": "", "setup": None, "alerted": [],
+            "candle_ts": 0.0, "sec_tries": 0, "why": "لا بيانات سوق بعد",
         }
         added.append(store[key])
     if added:
@@ -2311,7 +2336,18 @@ async def watch_cycle(app: Application) -> None:
             continue
         m = metrics.get(it["mint"])
         if m is None:
+            if it["mcap0"] <= 0 and now - it["added"] > 1800 and not it.get("nodata_notified"):
+                it["nodata_notified"] = True
+                await notify(app, it, f"❔ <code>{it['mint']}</code>\nلا بيانات سوق بعد 30 دقيقة (غير مدرجة على DexScreener). "
+                                      "تبقى في المراقبة وأفحصها فور ظهورها.")
             continue
+        if it["mcap0"] <= 0:                       # أول ظهور لبيانات عملة أُضيفت بلا بيانات
+            it["sym"], it["name"], it["pair"], it["dex"] = m["symbol"], m["name"], m["pair"], m["dex"]
+            it["mcap0"], it["price0"] = m["mcap"], m["price"]
+            it["factor"] = (m["mcap"] / m["price"]) if m["price"] > 0 else 0.0
+            it["kind"], it["why"] = "young", ""
+            await notify(app, it, f"📡 ظهرت بيانات سوق لـ <b>{html.escape(it['sym'])}</b> (MC {fmt_usd(m['mcap'])}) — أفحصها الآن.\n"
+                                  f"<code>{it['mint']}</code>")
         it["price"], it["mcap"], it["dex"], it["pair"] = m["price"], m["mcap"], m["dex"], m["pair"]
         it["chg1"] = m["chg1"]
         if WATCH_DEAD_PCT > 0 and it["mcap0"] > 0 and m["mcap"] < it["mcap0"] * (1 - WATCH_DEAD_PCT / 100) and not it.get("setup"):
@@ -2437,7 +2473,10 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             st = "👁 آمنة — بانتظار ارتداد"
         chg = (it["mcap"] / it["mcap0"] - 1) * 100 if it["mcap0"] > 0 else 0.0
-        lines.append(f"• <b>{html.escape(it['sym'])}</b> {fmt_usd(it['mcap0'])} ← {fmt_usd(it['mcap'])} ({chg:+.0f}%) — {st}")
+        if it["mcap0"] <= 0:
+            lines.append(f"• <code>{it['mint'][:6]}…{it['mint'][-4:]}</code> — {st}")
+        else:
+            lines.append(f"• <b>{html.escape(it['sym'])}</b> {fmt_usd(it['mcap0'])} ← {fmt_usd(it['mcap'])} ({chg:+.0f}%) — {st}")
         if it.get("off"):
             lines.append(f"   <i>{html.escape(it['off'])}</i>")
         elif it.get("why") and not it.get("setup"):
@@ -3254,6 +3293,16 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         added = add_watch(bd, update.effective_user.id, update.effective_chat.id, res.watch)
         if added:
             await safe_send(msg, format_watch_added(added))
+    if res is not None and res.unresolved:
+        try:
+            hint_set = {s.mint for s in _manual_store(bd, update.effective_user.id).values() if s.is_hint}
+            pend = add_watch_pending(bd, update.effective_user.id, update.effective_chat.id,
+                                     [a for a in res.unresolved if a not in hint_set])
+            if pend:
+                await safe_send(msg, f"⏳ {len(pend)} عقد بلا بيانات سوق بعد (جديدة جداً أو لم تُفهرس). أبقيتها في المراقبة وسأفحصها "
+                                     "تلقائياً فور ظهور بياناتها وأنبّهك. /watchlist لعرضها.")
+        except Exception:
+            log.exception("pending watch add failed")
     if res is not None and res.signals and res.discovered:
         try:
             record_scan(bd, update.effective_user.id, update.effective_chat.id, res)
@@ -3394,7 +3443,7 @@ async def run_all() -> None:
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
     watcher = asyncio.create_task(watch_loop(app))
-    log.info("SolAlpha Sniper v4.5 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v4.6 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
