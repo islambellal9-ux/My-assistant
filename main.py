@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v4.7 — Telegram bot (v4.4 + مسح السوق 24/24) (Render Web Service)
+SolAlpha Sniper v4.8 — Telegram bot (v4.4 + مسح السوق 24/24 يعمل تلقائياً) (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -1603,7 +1603,7 @@ WELCOME = (
 )
 
 HELP = (
-    "🤖 <b>مسح السوق 24/24</b>: /scan_on يفعّله (يعمل وحده ويرسل صفقات تلقائية لعملات جديدة كبيرة ومفحوصة بحسب نوع السوق)، /scan لحالته، /scan_off لإيقافه. باقي البوت لم يتغير.\n\n"
+    "🤖 <b>مسح السوق 24/24</b> يعمل تلقائياً: يسجّل أول محادثة تتفاعل معه ويرسل لها صفقات لعملات جديدة مفحوصة بحسب نوع السوق. /scan الحالة، /scan_now فحص فوري، /scan_off إيقاف، /scan_on لتحويله إلى محادثة/مجموعة أخرى.\n\n"
     "📤 <b>/export</b>: ملف شموع الدقيقة والإشارات لمعايرة كاشف الارتداد على كل عملاتك (أرسله لي).\n\n"
     "📍 <b>الدعم</b>: كل ارتداد مؤكد يُرسل لك كما هو، ويُوسم بقوة الدعم (✅ قوي / ⚠️ ضعيف) مع أقرب دعم تحته، وأنبّهك عند اقتراب السعر من دعم قوي. "
     "العملات لا تُحذف من القائمة تلقائياً إلا بانتهاء المدة (8 ساعات).\n\n"
@@ -1628,7 +1628,7 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/4.7", "Accept": "application/json"},
+        headers={"User-Agent": "SolAlphaSniper/4.8", "Accept": "application/json"},
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -2131,17 +2131,19 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 SCAN_STATE_FILE = os.getenv("SCAN_STATE_FILE", "scan_state.json")
 SCAN_CHAT_ID = int(os.getenv("SCAN_CHAT_ID", "0") or 0)          # بديل لـ /scan_on: يفعّل المسح تلقائياً لهذا الشات
 SCAN_INTERVAL_SEC = _env_float("SCAN_INTERVAL_SEC", 300)
-SCAN_MIN_MC = _env_float("SCAN_MIN_MC", 100_000)                 # ماركت كاب كبير فقط
+SCAN_MIN_MC = _env_float("SCAN_MIN_MC", 60_000)                 # ماركت كاب كبير فقط
 SCAN_MAX_MC = _env_float("SCAN_MAX_MC", 100_000_000)
-SCAN_MIN_LIQ = _env_float("SCAN_MIN_LIQ", 30_000)
-SCAN_MIN_VOL1H = _env_float("SCAN_MIN_VOL1H", 15_000)
-SCAN_MIN_AGE_MIN = _env_float("SCAN_MIN_AGE_MIN", 60)            # "جديدة": عمرها بين ساعة
+SCAN_MIN_LIQ = _env_float("SCAN_MIN_LIQ", 15_000)
+SCAN_MIN_VOL1H = _env_float("SCAN_MIN_VOL1H", 8_000)
+SCAN_MIN_AGE_MIN = _env_float("SCAN_MIN_AGE_MIN", 30)            # "جديدة": عمرها بين نصف ساعة
 SCAN_MAX_AGE_H = _env_float("SCAN_MAX_AGE_H", 72)                # و72 ساعة
 SCAN_MAX_TOP10 = _env_float("SCAN_MAX_TOP10", 35)                # فحص أمني أصرم من اليدوي
 SCAN_MAX_ALERTS_HOUR = int(_env_float("SCAN_MAX_ALERTS_HOUR", 3))
 SCAN_COIN_COOLDOWN_H = _env_float("SCAN_COIN_COOLDOWN_H", 4)
-SCAN_RUG_PER_CYCLE = int(_env_float("SCAN_RUG_PER_CYCLE", 6))
-SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 5))
+SCAN_RUG_PER_CYCLE = int(_env_float("SCAN_RUG_PER_CYCLE", 8))
+SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 8))
+SCAN_DEFAULT_ON = os.getenv("SCAN_DEFAULT_ON", "1") != "0"        # يعمل تلقائياً بلا أمر
+SCAN_HEARTBEAT_H = _env_float("SCAN_HEARTBEAT_H", 3)              # ملخص دوري ليظهر أنه حيّ
 SCAN_MAX_DISCOVER = 200
 SCAN_UNIVERSE_H = 12
 SCAN_MOMENTUM = os.getenv("SCAN_MOMENTUM", "1") != "0"
@@ -2150,11 +2152,13 @@ SCAN_REGIME_LABEL = {"hot": "🟢 صاعد", "neutral": "🟡 محايد", "blee
 
 
 def load_scan_state() -> dict:
-    st = {"on": False, "chat": 0}
+    st = {"on": SCAN_DEFAULT_ON, "chat": 0, "off_by_user": False}
     try:
         with open(SCAN_STATE_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        st["on"], st["chat"] = bool(d.get("on")), int(d.get("chat") or 0)
+        st["chat"] = int(d.get("chat") or 0)
+        st["off_by_user"] = bool(d.get("off_by_user"))
+        st["on"] = bool(d.get("on")) if "on" in d else st["on"]
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -2168,7 +2172,8 @@ def save_scan_state(sc: dict) -> None:
     try:
         tmp = SCAN_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"on": bool(sc.get("on")), "chat": int(sc.get("chat") or 0)}, f)
+            json.dump({"on": bool(sc.get("on")), "chat": int(sc.get("chat") or 0),
+                       "off_by_user": bool(sc.get("off_by_user"))}, f)
         os.replace(tmp, SCAN_STATE_FILE)
     except Exception as e:
         log.warning("save_scan_state failed: %s", e)
@@ -2454,43 +2459,10 @@ async def scan_send_momentum(app: Application, sc: dict, u: dict, m: dict, candl
     return True
 
 
-async def scan_loop(app: Application) -> None:
-    await asyncio.sleep(45)
-    while True:
-        sc = app.bot_data.setdefault("scan", {"on": False, "chat": 0})
-        try:
-            if sc.get("on") and sc.get("chat"):
-                await asyncio.wait_for(scan_cycle(app), timeout=240)
-                sc["ok_ts"] = time.time()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.exception("scan cycle failed")
-            sc["err"], sc["err_ts"] = f"{type(e).__name__}: {e}"[:160], time.time()
-        await asyncio.sleep(SCAN_INTERVAL_SEC)
-
-
-async def scan_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sc = context.application.bot_data.setdefault("scan", {"on": False, "chat": 0})
-    sc["on"], sc["chat"] = True, update.effective_chat.id
-    save_scan_state(sc)
-    await update.effective_message.reply_text(
-        "🤖 تم تفعيل مسح السوق 24/24 لهذه المحادثة.\n"
-        f"النطاق: ماركت كاب {fmt_usd(SCAN_MIN_MC)}–{fmt_usd(SCAN_MAX_MC)} • سيولة ≥ {fmt_usd(SCAN_MIN_LIQ)} • "
-        f"عمر {SCAN_MIN_AGE_MIN:.0f} دقيقة–{SCAN_MAX_AGE_H:.0f} ساعة • فحص أمني أصرم (Top10 ≤ {SCAN_MAX_TOP10:.0f}% وبلا تحذيرات).\n"
-        f"أقصى {SCAN_MAX_ALERTS_HOUR} صفقات في الساعة. المسح كل {SCAN_INTERVAL_SEC / 60:.0f} دقائق. /scan لحالة المسح، /scan_off للإيقاف.")
-
-
-async def scan_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sc = context.application.bot_data.setdefault("scan", {"on": False, "chat": 0})
-    sc["on"] = False
-    save_scan_state(sc)
-    await update.effective_message.reply_text("⏹️ أوقفت مسح السوق. قائمتك ومراقبتك اليدوية لم تتأثر.")
-
-
-async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sc = context.application.bot_data.setdefault("scan", {"on": False, "chat": 0})
-    lines = [f"🤖 <b>مسح السوق</b>: {'✅ يعمل' if sc.get('on') else '⏹️ متوقف (أرسل /scan_on)'}"]
+def scan_status_text(sc: dict) -> str:
+    lines = [f"🤖 <b>مسح السوق</b>: {'✅ يعمل' if sc.get('on') and sc.get('chat') else ('⏹️ متوقف' if not sc.get('on') else '⏳ ينتظر تسجيل محادثة (أرسل أي رسالة للبوت)')}"]
+    if sc.get("chat"):
+        lines.append(f"📮 يُرسل إلى: <code>{sc['chat']}</code> (انسخ هذا الرقم في SCAN_CHAT_ID ليبقى بعد أي إعادة تشغيل)")
     ok_ts, err_ts = sc.get("ok_ts"), sc.get("err_ts")
     if ok_ts:
         lines.append(f"⏱ آخر مسح ناجح: قبل {int(time.time() - ok_ts)}ث")
@@ -2518,7 +2490,96 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     vet = sum(1 for u in uni.values() if u.get("sec_ok"))
     lines.append(f"\n🗂️ الكون: {len(uni)} عملة تحت المسح ({vet} مفحوصة وسليمة) • تنبيهات آخر ساعة: "
                  f"{sum(1 for t in sc.get('alerts', []) if time.time() - t < 3600)}/{SCAN_MAX_ALERTS_HOUR}")
-    await safe_send(update.effective_message, "\n".join(lines))
+    return "\n".join(lines)
+
+
+async def scan_loop(app: Application) -> None:
+    await asyncio.sleep(45)
+    while True:
+        sc = app.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
+        try:
+            if sc.get("on") and sc.get("chat"):
+                first = not sc.get("ok_ts")
+                await asyncio.wait_for(scan_cycle(app), timeout=240)
+                sc["ok_ts"] = time.time()
+                if first or time.time() - sc.get("hb_ts", 0) > SCAN_HEARTBEAT_H * 3600:
+                    sc["hb_ts"] = time.time()
+                    head = ("✅ <b>بدأ مسح السوق 24/24</b> — يعمل وحده ويرسل الصفقات هنا.\n\n" if first
+                            else "🤖 <b>ملخص دوري</b> — المسح حيّ.\n\n")
+                    try:
+                        await app.bot.send_message(chat_id=sc["chat"], text=head + scan_status_text(sc),
+                                                   parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    except Exception:
+                        log.exception("scan heartbeat failed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("scan cycle failed")
+            sc["err"], sc["err_ts"] = f"{type(e).__name__}: {e}"[:160], time.time()
+        await asyncio.sleep(SCAN_INTERVAL_SEC)
+
+
+async def register_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أول محادثة (خاصة أو مجموعة) تتفاعل مع البوت بعد التشغيل تصبح وجهة الصفقات التلقائية."""
+    try:
+        sc = context.application.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
+        ch = update.effective_chat
+        if ch is None or ch.type == "channel" or sc.get("chat") or sc.get("off_by_user") or not sc.get("on"):
+            return
+        sc["chat"] = ch.id
+        save_scan_state(sc)
+        await context.bot.send_message(
+            chat_id=ch.id,
+            text=("🤖 سجّلتُ هذه المحادثة لتلقّي صفقات مسح السوق 24/24 (تبدأ خلال دقائق). "
+                  "لإيقافها: /scan_off • للحالة: /scan • لفحص فوري: /scan_now"))
+    except Exception:
+        log.exception("register_chat failed")
+
+
+async def scan_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sc = context.application.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
+    sc["on"], sc["chat"], sc["off_by_user"] = True, update.effective_chat.id, False
+    save_scan_state(sc)
+    await update.effective_message.reply_text(
+        "🤖 تم تفعيل مسح السوق 24/24 لهذه المحادثة (يصلح للمجموعات أيضاً: أرسل الأمر داخل المجموعة).\n"
+        f"النطاق: ماركت كاب {fmt_usd(SCAN_MIN_MC)}–{fmt_usd(SCAN_MAX_MC)} • سيولة ≥ {fmt_usd(SCAN_MIN_LIQ)} • "
+        f"عمر {SCAN_MIN_AGE_MIN:.0f} دقيقة–{SCAN_MAX_AGE_H:.0f} ساعة • فحص أمني أصرم.\n"
+        f"أقصى {SCAN_MAX_ALERTS_HOUR} صفقات في الساعة، والمسح كل {SCAN_INTERVAL_SEC / 60:.0f} دقائق.\n"
+        f"رقم هذه المحادثة: {update.effective_chat.id} — ضعه في SCAN_CHAT_ID على Render ليبقى بعد أي نشر.\n"
+        "/scan الحالة • /scan_now فحص فوري • /scan_off إيقاف.")
+
+
+async def scan_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sc = context.application.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
+    sc["on"], sc["off_by_user"] = False, True
+    save_scan_state(sc)
+    await update.effective_message.reply_text("⏹️ أوقفت مسح السوق. قائمتك ومراقبتك اليدوية لم تتأثر.")
+
+
+async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sc = context.application.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
+    await safe_send(update.effective_message, scan_status_text(sc))
+
+
+async def scan_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """فحص فوري يدوي: يشغّل دورة مسح واحدة ويعرض نتيجتها (لتتأكد أن المصادر تعمل)."""
+    bd = context.application.bot_data
+    sc = bd.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
+    if not sc.get("chat"):
+        sc["chat"] = update.effective_chat.id
+        save_scan_state(sc)
+    status = await update.effective_message.reply_text("🔎 دورة مسح فورية... (قد تستغرق دقيقة)")
+    try:
+        await asyncio.wait_for(scan_cycle(context.application), timeout=200)
+        sc["ok_ts"] = time.time()
+    except Exception as e:
+        log.exception("scan_now failed")
+        sc["err"], sc["err_ts"] = f"{type(e).__name__}: {e}"[:160], time.time()
+    try:
+        await status.edit_text("✅ انتهت الدورة")
+    except Exception:
+        pass
+    await safe_send(update.effective_message, scan_status_text(sc))
 
 
 async def notify(app: Application, it: dict, text: str) -> None:
@@ -3676,6 +3737,8 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("scan_on", scan_on_cmd))
     app.add_handler(CommandHandler("scan_off", scan_off_cmd))
     app.add_handler(CommandHandler("scan", scan_cmd))
+    app.add_handler(CommandHandler("scan_now", scan_now_cmd))
+    app.add_handler(MessageHandler(filters.ALL, register_chat), group=-1)
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT | filters.CAPTION), on_user_message
     ))
@@ -3689,7 +3752,7 @@ async def run_all() -> None:
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
     watcher = asyncio.create_task(watch_loop(app))
     scanner = asyncio.create_task(scan_loop(app))
-    log.info("SolAlpha Sniper v4.7 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v4.8 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
