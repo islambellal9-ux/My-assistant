@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v5.3 — Telegram bot (v5.2 + طبقة جودة: منع شراء القمم، تعلّم من نتائج السوق، منع تكرار الإشارات) (Render Web Service)
+SolAlpha Sniper v5.4 — Telegram bot (v5.3 + محرك أنماط: ارتداد/اختراق قاعدة، تعلّم يعطّل النمط الفاشل، حفظ الصفقات والذاكرة عبر إعادة التشغيل) (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -1208,11 +1208,11 @@ LEARN_HIGHRISK_P = _env_float("LEARN_HIGHRISK_P", 0.45)     # العملة عا�
 SHADOW_MAX = int(_env_float("SHADOW_MAX", 220))
 SHADOW_TTL_MIN = _env_float("SHADOW_TTL_MIN", 60)           # مهلة الحكم على الصفقة (نجاح = بلوغ TP1 قبل SL)
 COOL_LOSS_H = _env_float("COOL_LOSS_H", 24)                 # عملة ضربت الوقف: لا تُعاد قبل هذه المدة
-Q_MIN_PULLBACK = _env_float("Q_MIN_PULLBACK", 0.06)         # أقل تصحيح عن القمة المحلية (لا شراء قمم)
+Q_MIN_PULLBACK = _env_float("Q_MIN_PULLBACK", 0.04)         # أقل تصحيح عن القمة المحلية (لا شراء قمم)
 Q_MAX_PULLBACK = _env_float("Q_MAX_PULLBACK", 0.45)
 Q_MAX_RUN15 = _env_float("Q_MAX_RUN15", 0.35)               # أقصى صعود خلال 15 دقيقة (مطاردة)
 Q_MAX_LAST3 = _env_float("Q_MAX_LAST3", 0.15)               # أقصى صعود آخر 3 شموع (انفجار)
-Q_MIN_RR1 = _env_float("Q_MIN_RR1", 1.3)
+Q_MIN_RR1 = _env_float("Q_MIN_RR1", 1.15)
 
 LEARN: dict = {"b": {}, "rej": [0, 0], "cool": {}, "w": 0, "l": 0}
 
@@ -1258,7 +1258,7 @@ def learn_feats(m: dict, ef: Optional[dict], lvl: str, regime: dict, kind: str) 
         "pace": _bucket(m.get("vol_pace", 1.0), [0.5, 1.0, 2.0]),
         "buy": _bucket(m["buy_ratio5"], [0.55, 0.65]),
         "pull": _bucket((ef or {}).get("pull", 0.1), [0.1, 0.2, 0.3]),
-        "risk": lvl,
+        "risk": lvl, "pat": (ef or {}).get("pat") or "-",
     }
 
 
@@ -1277,61 +1277,110 @@ def learn_record(f: dict, win: bool) -> None:
     for k, v in f.items():
         rec = LEARN["b"].setdefault(f"{k}={v}", [0, 0])
         rec[0 if win else 1] += 1
+        if rec[0] + rec[1] > 60:            # تقادم: الأحدث أهم (السوق يتغير)
+            rec[0], rec[1] = round(rec[0] * 0.8), round(rec[1] * 0.8)
     LEARN["w" if win else "l"] += 1
 
 
+def _base_break(w: list, price: float) -> Optional[dict]:
+    """اختراق قاعدة تماسك: 10 شموع ضيقة (≤15%) ثم شمعة خضراء بحجم ≥1.5× المتوسط والسعر فوق سقف القاعدة بـ0.3–7%."""
+    if len(w) < 12:
+        return None
+    base = w[-11:-1]
+    bh = max(c[2] for c in base)
+    bl = min(c[3] for c in base)
+    if bl <= 0:
+        return None
+    h = bh / bl - 1
+    if h > 0.15 or h < 0.01:
+        return None
+    if not (bh * 1.003 <= price <= bh * 1.07):
+        return None
+    last = w[-1]
+    if last[4] <= last[1]:
+        return None
+    avg_v = sum(c[5] for c in base) / len(base)
+    if avg_v <= 0 or last[5] < avg_v * 1.5:
+        return None
+    return {"base_hi": bh, "base_lo": bl, "base_h": h}
+
+
 def entry_quality(candles: list, m: dict) -> dict:
-    """هيكل الدخول: لا شراء عند القمة. المطلوب: تصحيح 6–45% عن القمة المحلية + قاع أعلى + شمعتان خضراوان من آخر ثلاث،
-    ولا مطاردة (صعود >35% في 15د أو >15% في آخر 3 شموع)."""
+    """محرك الأنماط. لا شراء قمم ولا مطاردة. نمطان:
+    DIP  = تصحيح 4–45% عن القمة المحلية + قاع أعلى + شمعتان خضراوان من آخر ثلاث.
+    BASE = اختراق قاعدة تماسك بحجم (زخم حقيقي، لا صعود عمودي)."""
     w = list(candles[:-1][-60:]) if candles else []
-    if len(w) < 10:
-        return {"ok": False, "code": "شموع قليلة", "why": f"شموع قليلة ({len(w)}) — انتظار تكوّن هيكل", "pull": 0.0}
+    if len(w) < 8:
+        return {"ok": False, "code": "شموع قليلة", "why": f"شموع قليلة ({len(w)}) — انتظار تكوّن هيكل", "pull": 0.0, "pat": ""}
     price = m["price"]
     hi = max(c[2] for c in w)
     lo = min(c[3] for c in w)
     if price <= 0 or hi <= 0 or lo <= 0:
-        return {"ok": False, "code": "بيانات", "why": "بيانات شموع غير صالحة", "pull": 0.0}
-    hi_ratio = price / hi
-    pull = 1 - hi_ratio
-    from_low = price / lo - 1
+        return {"ok": False, "code": "بيانات", "why": "بيانات شموع غير صالحة", "pull": 0.0, "pat": ""}
+    pull = 1 - price / hi
     ref15 = w[-15][4] if len(w) >= 15 else w[0][4]
     run15 = (price / ref15 - 1) if ref15 > 0 else 0.0
     ref3 = w[-3][4]
     last3 = (price / ref3 - 1) if ref3 > 0 else 0.0
     recent_low = min(c[3] for c in w[-5:])
-    prev_low = min(c[3] for c in w[-10:-5])
+    prev_low = min(c[3] for c in w[-10:-5]) if len(w) >= 10 else recent_low
+    swing_low = min(c[3] for c in w[-3:])
     greens = sum(1 for c in w[-3:] if c[4] > c[1])
     ef = {"hi": hi, "lo": lo, "pull": pull, "run15": run15, "last3": last3, "recent_low": recent_low,
-          "swing_low": min(c[3] for c in w[-3:]),
-          "from_low": from_low, "ok": False, "code": "", "why": ""}
+          "swing_low": swing_low, "from_low": price / lo - 1, "ok": False, "code": "", "why": "", "pat": ""}
     if run15 > Q_MAX_RUN15:
         ef.update(code="مطاردة", why=f"صعد +{run15 * 100:.0f}% خلال 15 دقيقة (مطاردة قمة)")
-    elif last3 > Q_MAX_LAST3:
+        return ef
+    if last3 > Q_MAX_LAST3:
         ef.update(code="انفجار", why=f"آخر 3 شموع +{last3 * 100:.0f}% (انفجار سعري)")
-    elif pull < Q_MIN_PULLBACK:
-        ef.update(code="قمة", why=f"السعر عند القمة (تصحيح {pull * 100:.0f}% فقط) — شراء قمة")
+        return ef
+    fail = None
+    if pull < Q_MIN_PULLBACK:
+        fail = ("قمة", f"السعر عند القمة (تصحيح {pull * 100:.0f}% فقط) — شراء قمة")
     elif pull > Q_MAX_PULLBACK:
-        ef.update(code="تصحيح عميق", why=f"تصحيح {pull * 100:.0f}% — هيكل ضعيف")
-    elif price <= ef["swing_low"] * 1.01:
-        ef.update(code="كسر القاع", why="السعر كسر/لامس آخر قاع — الارتداد فشل")
+        fail = ("تصحيح عميق", f"تصحيح {pull * 100:.0f}% — هيكل ضعيف")
+    elif price <= swing_low * 1.01:
+        fail = ("كسر القاع", "السعر كسر/لامس آخر قاع — الارتداد فشل")
     elif recent_low < prev_low * 0.985:
-        ef.update(code="قاع هابط", why="القيعان ما زالت تهبط — لم يتشكل قاع أعلى")
+        fail = ("قاع هابط", "القيعان ما زالت تهبط — لم يتشكل قاع أعلى")
     elif greens < 2:
-        ef.update(code="لا تأكيد", why="لا شمعتان خضراوان من آخر ثلاث — الارتداد غير مؤكد")
-    else:
-        ef["ok"] = True
+        fail = ("لا تأكيد", "لا شمعتان خضراوان من آخر ثلاث — الارتداد غير مؤكد")
+    if fail is None:
+        ef.update(ok=True, pat="DIP")
+        return ef
+    br = _base_break(w, price)
+    if br:
+        ef.update(ok=True, pat="BASE", **br)
+        return ef
+    ef.update(code=fail[0], why=fail[1])
     return ef
 
 
+def pattern_line(ef: dict) -> str:
+    if ef.get("pat") == "BASE":
+        return (f"📦➡️🚀 نمط: اختراق قاعدة تماسك ({ef['base_h'] * 100:.0f}%) بحجم ≥1.5× — "
+                "دخول عند الاختراق لا في صعود عمودي")
+    return f"📉➡️📈 نمط: ارتداد بعد تصحيح {ef['pull'] * 100:.0f}% + قاع أعلى + تأكيد (لا شراء قمة)"
+
+
 def make_dip_plan(m: dict, candles: list, ef: dict):
-    """خطة دخول بعد تصحيح: الوقف تحت القاع الأخير، الهدف الأول نصف المسافة للقمة (≥ +10%) والثاني القمة (≥ +20%)."""
+    """خطة الدخول حسب النمط. DIP: وقف تحت آخر قاع أعلى وهدف نحو القمة. BASE: وقف تحت سقف القاعدة وهدف بقياس ارتفاعها."""
     plan = compute_alt_plan("MOMENTUM", m, candles)
-    price, hi, rl = m["price"], ef["hi"], ef["swing_low"]
-    sl = max(rl * 0.98, price * 0.88)          # تحت آخر قاع أعلى (فشل الاحتفاظ به = خروج فوري)
-    if sl >= price * 0.97:
-        sl = price * 0.94
-    tp1 = max(price * 1.10, price + 0.5 * (hi - price))
-    tp2 = max(price * 1.20, hi, tp1 * 1.05)
+    price = m["price"]
+    if ef.get("pat") == "BASE":
+        sl = max(ef["base_hi"] * 0.97, price * 0.91)
+        if sl >= price * 0.97:
+            sl = price * 0.94
+        h = max(ef["base_h"], 0.08)
+        tp1 = price * (1 + h)
+        tp2 = max(price * (1 + max(2 * ef["base_h"], 0.16)), tp1 * 1.05)
+    else:
+        hi, rl = ef["hi"], ef["swing_low"]
+        sl = max(rl * 0.98, price * 0.88)
+        if sl >= price * 0.97:
+            sl = price * 0.94
+        tp1 = max(price * 1.10, price + 0.5 * (hi - price))
+        tp2 = max(price * 1.20, hi, tp1 * 1.05)
     risk = price - sl
     plan.sl, plan.tp1, plan.tp2 = sl, tp1, tp2
     plan.risk_pct = risk / price * 100
@@ -1389,8 +1438,14 @@ def shadow_update(sc: dict, metrics: dict, now: float) -> bool:
 def quality_gate(m: dict, ef: Optional[dict], lvl: str, regime: dict, kind: str):
     f = learn_feats(m, ef, lvl, regime, kind)
     p, n = learn_p(f)
-    need = LEARN_HIGHRISK_P if lvl == "high" else LEARN_MIN_P
-    return p >= need, p, n, f
+    pw, pl = LEARN["b"].get(f"pat={f['pat']}", [0, 0])
+    if pw + pl >= 10 and pw / (pw + pl) < 0.25:
+        return False, p, n, f               # هذا النمط يفشل حالياً في هذا السوق → معطّل مؤقتاً (الظلال تتابع تعافيه)
+    if lvl == "high":
+        return p >= LEARN_HIGHRISK_P, p, n, f
+    if n < 5:
+        return True, p, n, f                # لا بيانات كافية للحجب بعد
+    return p >= LEARN_MIN_P, p, n, f
 
 
 def learn_text(p: float, n: int) -> str:
@@ -1398,6 +1453,95 @@ def learn_text(p: float, n: int) -> str:
     if done < 8:
         return f"🧠 احتمال النجاح: {p:.0%} (تقدير أولي — البوت ما زال يجمع نتائج: {done})"
     return f"🧠 احتمال النجاح التاريخي لصفقات مشابهة: {p:.0%} (خبرة {n} نتيجة)"
+
+
+
+# ───────────────────── حفظ الحالة عبر إعادة التشغيل ─────────────────────
+STATE_TAG = "SOLALPHA_STATE"
+
+
+def state_blob(sc: dict) -> str:
+    now = time.time()
+    pos = {k: {kk: vv for kk, vv in v.items() if kk != "ph"} for k, v in (sc.get("pos") or {}).items()}
+    cool = {k: int(v) for k, v in LEARN["cool"].items() if v > now}
+    learn = {"b": LEARN["b"], "rej": LEARN["rej"], "w": LEARN["w"], "l": LEARN["l"]}
+    for _ in range(40):
+        txt = STATE_TAG + "\n" + json.dumps({"pos": pos, "cool": cool, "learn": learn}, separators=(",", ":"), ensure_ascii=False)
+        if len(txt) <= 3900:
+            return txt
+        if cool:
+            for k in sorted(cool, key=cool.get)[:max(1, len(cool) // 3)]:
+                cool.pop(k)
+        elif learn["b"]:
+            for k in sorted(learn["b"], key=lambda x: sum(learn["b"][x]))[:max(1, len(learn["b"]) // 4)]:
+                learn["b"].pop(k)
+        else:
+            break
+    return STATE_TAG + "\n{}"
+
+
+async def backup_state(app: Application, force: bool = False) -> None:
+    bd = app.bot_data
+    sc = bd.get("scan") or {}
+    chat = sc.get("chat")
+    if not chat:
+        return
+    txt = state_blob(sc)
+    sig = hash(txt)
+    if not force and (sig == bd.get("state_sig") or time.time() - bd.get("state_ts", 0) < 120):
+        return
+    bd["state_ts"] = time.time()
+    try:
+        mid = bd.get("state_msg")
+        if mid:
+            try:
+                await app.bot.edit_message_text(chat_id=chat, message_id=mid, text=txt)
+                bd["state_sig"] = sig
+                return
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    bd["state_sig"] = sig
+                    return
+                bd["state_msg"] = None
+        msg = await app.bot.send_message(chat_id=chat, text=txt, disable_notification=True)
+        bd["state_msg"] = msg.message_id
+        bd["state_sig"] = sig
+        try:
+            await app.bot.pin_chat_message(chat_id=chat, message_id=msg.message_id, disable_notification=True)
+        except Exception as e:
+            log.warning("pin state message failed: %s", e)
+    except Exception as e:
+        log.warning("backup_state failed: %s", e)
+
+
+async def restore_state(app: Application) -> None:
+    bd = app.bot_data
+    if bd.get("state_restored"):
+        return
+    sc = bd.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
+    chat = sc.get("chat")
+    if not chat:
+        return
+    bd["state_restored"] = True
+    try:
+        ch = await app.bot.get_chat(chat)
+        pm = getattr(ch, "pinned_message", None)
+        txt = getattr(pm, "text", None) or ""
+        if not txt.startswith(STATE_TAG):
+            return
+        bd["state_msg"] = pm.message_id
+        d = json.loads(txt[len(STATE_TAG):].strip() or "{}")
+        if not (sc.get("pos")):
+            sc["pos"] = {k: dict(v, ph=[]) for k, v in (d.get("pos") or {}).items()}
+        for k, v in (d.get("cool") or {}).items():
+            LEARN["cool"][k] = max(LEARN["cool"].get(k, 0), float(v))
+        lr = d.get("learn") or {}
+        if LEARN["w"] + LEARN["l"] == 0 and lr:
+            LEARN["b"], LEARN["rej"] = lr.get("b", {}), lr.get("rej", [0, 0])
+            LEARN["w"], LEARN["l"] = lr.get("w", 0), lr.get("l", 0)
+        log.info("state restored: %d positions, %d learned results", len(sc.get("pos") or {}), LEARN["w"] + LEARN["l"])
+    except Exception as e:
+        log.warning("restore_state failed: %s", e)
 
 
 # ───────────────────────────── المسح الكامل ─────────────────────────────
@@ -1851,7 +1995,7 @@ HELP = (
 
 
 async def post_init(application: Application) -> None:
-    hdrs = {"User-Agent": "SolAlphaSniper/5.3", "Accept": "application/json"}
+    hdrs = {"User-Agent": "SolAlphaSniper/5.4", "Accept": "application/json"}
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0, pool=20.0), headers=hdrs, follow_redirects=True,
         limits=httpx.Limits(max_connections=40, max_keepalive_connections=15),
@@ -2378,31 +2522,31 @@ SCAN_MIN_AGE_MIN = _env_float("SCAN_MIN_AGE_MIN", 30)
 SCAN_MAX_AGE_H = _env_float("SCAN_MAX_AGE_H", 72)
 # مسار العملات الناشئة (دقائق معدودة، ماركت كاب صغير)
 ALPHA_ON = os.getenv("ALPHA_ON", "1") != "0"
-ALPHA_MIN_AGE_MIN = _env_float("ALPHA_MIN_AGE_MIN", 4)
+ALPHA_MIN_AGE_MIN = _env_float("ALPHA_MIN_AGE_MIN", 3)
 ALPHA_MAX_AGE_MIN = _env_float("ALPHA_MAX_AGE_MIN", 240)
 ALPHA_MIN_MC = _env_float("ALPHA_MIN_MC", 30_000)
 ALPHA_MAX_MC = _env_float("ALPHA_MAX_MC", 250_000)
 ALPHA_MIN_LIQ = _env_float("ALPHA_MIN_LIQ", 7_000)
 ALPHA_MIN_VOL1H = _env_float("ALPHA_MIN_VOL1H", 4_000)
 ALPHA_MIN_TXN5 = _env_float("ALPHA_MIN_TXN5", 15)
-ALPHA_MIN_CHG5 = _env_float("ALPHA_MIN_CHG5", 0.5)
+ALPHA_MIN_CHG5 = _env_float("ALPHA_MIN_CHG5", -3.0)
 ALPHA_MIN_CHG1 = _env_float("ALPHA_MIN_CHG1", -15.0)
 ALPHA_MAX_CHG1 = _env_float("ALPHA_MAX_CHG1", 150.0)
-ALPHA_MIN_BUY = _env_float("ALPHA_MIN_BUY", 0.55)
+ALPHA_MIN_BUY = _env_float("ALPHA_MIN_BUY", 0.50)
 ALPHA_MIN_SCORE = int(_env_float("ALPHA_MIN_SCORE", 55))
 # أمان وسقوف
 SCAN_MAX_TOP10 = _env_float("SCAN_MAX_TOP10", 35)
-SCAN_MAX_ALERTS_HOUR = int(_env_float("SCAN_MAX_ALERTS_HOUR", 6))
-SCAN_COIN_COOLDOWN_H = _env_float("SCAN_COIN_COOLDOWN_H", 8)
-SCAN_MAX_HIGHRISK_HOUR = int(_env_float("SCAN_MAX_HIGHRISK_HOUR", 1))   # صفقات "مخاطرة Rug عالية" بالساعة
-ALPHA_MIN_HOLDERS = _env_float("ALPHA_MIN_HOLDERS", 80)                 # عدد مالكين أدنى (من RugCheck)
+SCAN_MAX_ALERTS_HOUR = int(_env_float("SCAN_MAX_ALERTS_HOUR", 10))
+SCAN_COIN_COOLDOWN_H = _env_float("SCAN_COIN_COOLDOWN_H", 6)
+SCAN_MAX_HIGHRISK_HOUR = int(_env_float("SCAN_MAX_HIGHRISK_HOUR", 2))   # صفقات "مخاطرة Rug عالية" بالساعة
+ALPHA_MIN_HOLDERS = _env_float("ALPHA_MIN_HOLDERS", 60)                 # عدد مالكين أدنى (من RugCheck)
 RISK_HIGH_PTS = int(_env_float("RISK_HIGH_PTS", 5))
 RISK_MED_PTS = int(_env_float("RISK_MED_PTS", 3))
 GUARD_INTERVAL_SEC = _env_float("GUARD_INTERVAL_SEC", 25)               # حارس الصفقات المفتوحة
 GUARD_LIQ_DROP_PCT = _env_float("GUARD_LIQ_DROP_PCT", 35)               # سحب سيولة بعد الدخول
 GUARD_FLASH_PCT = _env_float("GUARD_FLASH_PCT", 30)                     # هبوط حاد خلال 4 دقائق
 SCAN_RUG_PER_CYCLE = int(_env_float("SCAN_RUG_PER_CYCLE", 16))
-SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 14))
+SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 18))
 SCAN_MAX_DISCOVER = 300
 SCAN_MAX_FETCH = 340
 NURSERY_H = _env_float("NURSERY_H", 3)            # ساعات بقاء العملة الجديدة في الحضانة اللحظية
@@ -2816,6 +2960,7 @@ async def scan_guard_loop(app: Application) -> None:
     while True:
         try:
             await asyncio.wait_for(scan_guard_cycle(app), timeout=60)
+            await backup_state(app)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2878,8 +3023,8 @@ async def scan_cycle(app: Application) -> dict:
 
     # 2) بيانات السوق: المكتشف + الكون + صفقات المسح المفتوحة
     t1 = time.time()
-    all_addrs = list(dict.fromkeys(addrs + sorted(nur, key=nur.get, reverse=True) + list(uni)
-                                   + list((sc.get("pos") or {})) + list((sc.get("shadow") or {}))))[:SCAN_MAX_FETCH]
+    all_addrs = list(dict.fromkeys(list((sc.get("pos") or {})) + list((sc.get("shadow") or {})) + addrs
+                                   + sorted(nur, key=nur.get, reverse=True) + list(uni)))[:SCAN_MAX_FETCH]
     sink: dict = {}
     if all_addrs:
         try:
@@ -3035,7 +3180,11 @@ async def scan_send_bounce(app, sc: dict, u: dict, m: dict, setup: dict, candles
     lvl, rtxt, ok = scan_risk_gate(sc, u, m)
     if not ok:
         return False
-    ef_b = {"pull": max(0.0, 1 - m["price"] / setup["peak"]) if setup.get("peak") else 0.1}
+    risk_b = setup["entry"] - setup["sl"]
+    if risk_b <= 0 or risk_b / setup["entry"] > 0.13 or (setup["tp1"] - setup["entry"]) / risk_b < 1.1:
+        qnote(sc, "ارتداد: عائد/مخاطرة ضعيف")
+        return False
+    ef_b = {"pull": max(0.0, 1 - m["price"] / setup["peak"]) if setup.get("peak") else 0.1, "pat": "BOUNCE"}
     okq, p, n, feats = quality_gate(m, ef_b, lvl, regime, "BOUNCE")
     if not okq:
         qnote(sc, "احتمال تاريخي منخفض")
@@ -3091,7 +3240,7 @@ async def scan_send_momentum(app, sc: dict, u: dict, m: dict, candles: list, reg
     it = scan_it(chat, m, u["sec_obj"])
     c = Candidate(m, u["sec_obj"], plan, score, b)
     tp0 = tp0_for(lvl, plan.entry, regime)
-    await notify(app, it, scan_header("🚀 زخم بعد تصحيح", regime) + rtxt + "\n" + learn_text(p, n) + "\n"
+    await notify(app, it, scan_header("🚀 زخم مؤكد", regime) + pattern_line(ef) + "\n" + rtxt + "\n" + learn_text(p, n) + "\n"
                  + quick_exit_line(lvl, plan.entry, regime) + "\n" + format_best(c, []))
     if lvl == "high":
         sc.setdefault("hr", []).append(time.time())
@@ -3134,11 +3283,11 @@ async def scan_send_alpha(app, sc: dict, u: dict, m: dict, candles: list, regime
     c = Candidate(m, u["sec_obj"], plan, score, b)
     age = m.get("age_min") or 0
     holders = u.get("holders")
-    head = scan_header("🆕 عملة ناشئة — ارتداد بعد تصحيح", regime) + (
+    head = scan_header("🆕 عملة ناشئة", regime) + (
         f"⏱ عمر الزوج {age:.0f} دقيقة • MC {fmt_usd(m['mcap'])} • سيولة {fmt_usd(m['liq'])} • "
         f"5د {m['chg5']:+.0f}% • 1س {m['chg1']:+.0f}% • شراء {m['buy_ratio5'] * 100:.0f}%"
         + (f" • {holders:.0f} مالك" if holders is not None else "") + "\n"
-        f"📉➡️📈 تصحيح {ef['pull'] * 100:.0f}% من القمة المحلية ثم قاع أعلى وتأكيد ارتداد (لا شراء قمة)\n"
+        f"{pattern_line(ef)}\n"
         f"🛡️ {html.escape(u.get('sec_txt') or '')}\n" + rtxt + "\n" + learn_text(p, n) + "\n"
         + quick_exit_line(lvl, plan.entry, regime) + "\n")
     tp0 = tp0_for(lvl, plan.entry, regime)
@@ -3190,6 +3339,13 @@ def scan_status_text(sc: dict) -> str:
                         if rj[0] + rj[1] >= 5 else ""))
     else:
         lines.append("🧠 التعلم: يجمع نتائج السوق الآن (ظلال متابعة: %d)" % len(sc.get("shadow") or {}))
+    pats = []
+    for pk, nm in (("DIP", "ارتداد بعد تصحيح"), ("BASE", "اختراق قاعدة"), ("BOUNCE", "ارتداد دعم")):
+        w_, l_ = LEARN["b"].get(f"pat={pk}", [0, 0])
+        if w_ + l_:
+            pats.append(f"{nm} {w_ / (w_ + l_):.0%} ({w_ + l_})")
+    if pats:
+        lines.append("📊 أداء الأنماط (تعلّم): " + " • ".join(pats))
     qs = sc.get("qstats") or {}
     if qs:
         lines.append("🚫 رُفضت بفلتر الجودة: " + "، ".join(f"{k} {v}" for k, v in sorted(qs.items(), key=lambda kv: -kv[1])[:6]))
@@ -3206,7 +3362,9 @@ def scan_status_text(sc: dict) -> str:
 async def scan_loop(app: Application) -> None:
     """حلقة مستقلة: كل دورة بمهلة صارمة، وأي فشل لا يوقفها، وتنام دائماً بين الدورات."""
     GECKO_LANE.set("scan")
-    await asyncio.sleep(30)
+    await asyncio.sleep(20)
+    await restore_state(app)
+    await asyncio.sleep(10)
     while True:
         sc = app.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
         try:
@@ -3246,6 +3404,7 @@ async def register_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         sc["chat"] = ch.id
         save_scan_state(sc)
+        await restore_state(context.application)
         await context.bot.send_message(
             chat_id=ch.id,
             text=("🤖 سجّلتُ هذه المحادثة لتلقّي صفقات مسح السوق 24/24 (تبدأ خلال دقائق). "
@@ -4594,7 +4753,7 @@ async def run_all() -> None:
     scanner = asyncio.create_task(supervised("scan", scan_loop, app))
     guard = asyncio.create_task(supervised("guard", scan_guard_loop, app))
     dog = asyncio.create_task(watchdog_loop(app))
-    log.info("SolAlpha Sniper v5.3 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v5.4 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -4608,6 +4767,10 @@ async def run_all() -> None:
         await stop.wait()
     finally:
         log.info("Shutting down...")
+        try:
+            await asyncio.wait_for(backup_state(app, force=True), timeout=6)
+        except Exception:
+            pass
         keepalive.cancel()
         watcher.cancel()
         scanner.cancel()
