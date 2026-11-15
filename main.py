@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v5.4 — Telegram bot (v5.3 + محرك أنماط: ارتداد/اختراق قاعدة، تعلّم يعطّل النمط الفاشل، حفظ الصفقات والذاكرة عبر إعادة التشغيل) (Render Web Service)
+SolAlpha Sniper v5.5 — Telegram bot (v5.4 + مستويات صيد تتوسّع تلقائياً عند الصمت + تقرير تشخيص + رسالة إعادة التشغيل) (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -1216,6 +1216,13 @@ Q_MIN_RR1 = _env_float("Q_MIN_RR1", 1.15)
 
 LEARN: dict = {"b": {}, "rej": [0, 0], "cool": {}, "w": 0, "l": 0}
 
+RELAX = 0          # مستوى الصيد 0..3: يتوسّع تلقائياً كلما طال الصمت (الأمان الصلب لا يتغيّر أبداً)
+RELAX_MIN = (40, 80, 140)   # دقائق بلا صفقات للانتقال للمستوى 1/2/3
+
+
+def rx(a, b, c, d):
+    return (a, b, c, d)[min(RELAX, 3)]
+
 
 def learn_load() -> None:
     try:
@@ -1258,7 +1265,7 @@ def learn_feats(m: dict, ef: Optional[dict], lvl: str, regime: dict, kind: str) 
         "pace": _bucket(m.get("vol_pace", 1.0), [0.5, 1.0, 2.0]),
         "buy": _bucket(m["buy_ratio5"], [0.55, 0.65]),
         "pull": _bucket((ef or {}).get("pull", 0.1), [0.1, 0.2, 0.3]),
-        "risk": lvl, "pat": (ef or {}).get("pat") or "-",
+        "risk": lvl, "pat": (ef or {}).get("pat") or "-", "rx": RELAX,
     }
 
 
@@ -1300,7 +1307,7 @@ def _base_break(w: list, price: float) -> Optional[dict]:
     if last[4] <= last[1]:
         return None
     avg_v = sum(c[5] for c in base) / len(base)
-    if avg_v <= 0 or last[5] < avg_v * 1.5:
+    if avg_v <= 0 or last[5] < avg_v * rx(1.5, 1.3, 1.2, 1.2):
         return None
     return {"base_hi": bh, "base_lo": bl, "base_h": h}
 
@@ -1328,22 +1335,22 @@ def entry_quality(candles: list, m: dict) -> dict:
     greens = sum(1 for c in w[-3:] if c[4] > c[1])
     ef = {"hi": hi, "lo": lo, "pull": pull, "run15": run15, "last3": last3, "recent_low": recent_low,
           "swing_low": swing_low, "from_low": price / lo - 1, "ok": False, "code": "", "why": "", "pat": ""}
-    if run15 > Q_MAX_RUN15:
+    if run15 > rx(Q_MAX_RUN15, Q_MAX_RUN15 * 1.2, Q_MAX_RUN15 * 1.5, Q_MAX_RUN15 * 1.7):
         ef.update(code="مطاردة", why=f"صعد +{run15 * 100:.0f}% خلال 15 دقيقة (مطاردة قمة)")
         return ef
-    if last3 > Q_MAX_LAST3:
+    if last3 > rx(Q_MAX_LAST3, Q_MAX_LAST3 * 1.2, Q_MAX_LAST3 * 1.5, Q_MAX_LAST3 * 1.5):
         ef.update(code="انفجار", why=f"آخر 3 شموع +{last3 * 100:.0f}% (انفجار سعري)")
         return ef
     fail = None
-    if pull < Q_MIN_PULLBACK:
+    if pull < rx(Q_MIN_PULLBACK, 0.03, 0.025, 0.02):
         fail = ("قمة", f"السعر عند القمة (تصحيح {pull * 100:.0f}% فقط) — شراء قمة")
-    elif pull > Q_MAX_PULLBACK:
+    elif pull > rx(Q_MAX_PULLBACK, 0.50, 0.55, 0.60):
         fail = ("تصحيح عميق", f"تصحيح {pull * 100:.0f}% — هيكل ضعيف")
     elif price <= swing_low * 1.01:
         fail = ("كسر القاع", "السعر كسر/لامس آخر قاع — الارتداد فشل")
-    elif recent_low < prev_low * 0.985:
+    elif recent_low < prev_low * rx(0.985, 0.97, 0.95, 0.95):
         fail = ("قاع هابط", "القيعان ما زالت تهبط — لم يتشكل قاع أعلى")
-    elif greens < 2:
+    elif greens < rx(2, 1, 1, 1):
         fail = ("لا تأكيد", "لا شمعتان خضراوان من آخر ثلاث — الارتداد غير مؤكد")
     if fail is None:
         ef.update(ok=True, pat="DIP")
@@ -1439,11 +1446,11 @@ def quality_gate(m: dict, ef: Optional[dict], lvl: str, regime: dict, kind: str)
     f = learn_feats(m, ef, lvl, regime, kind)
     p, n = learn_p(f)
     pw, pl = LEARN["b"].get(f"pat={f['pat']}", [0, 0])
-    if pw + pl >= 10 and pw / (pw + pl) < 0.25:
+    if RELAX < 3 and pw + pl >= 10 and pw / (pw + pl) < 0.25:
         return False, p, n, f               # هذا النمط يفشل حالياً في هذا السوق → معطّل مؤقتاً (الظلال تتابع تعافيه)
     if lvl == "high":
         return p >= LEARN_HIGHRISK_P, p, n, f
-    if n < 5:
+    if n < rx(5, 10, 20, 1000):
         return True, p, n, f                # لا بيانات كافية للحجب بعد
     return p >= LEARN_MIN_P, p, n, f
 
@@ -1995,7 +2002,7 @@ HELP = (
 
 
 async def post_init(application: Application) -> None:
-    hdrs = {"User-Agent": "SolAlphaSniper/5.4", "Accept": "application/json"}
+    hdrs = {"User-Agent": "SolAlphaSniper/5.5", "Accept": "application/json"}
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(12.0, pool=20.0), headers=hdrs, follow_redirects=True,
         limits=httpx.Limits(max_connections=40, max_keepalive_connections=15),
@@ -2510,7 +2517,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 SCAN_STATE_FILE = os.getenv("SCAN_STATE_FILE", "scan_state.json")
 SCAN_CHAT_ID = int(os.getenv("SCAN_CHAT_ID", "0") or 0)
 SCAN_DEFAULT_ON = os.getenv("SCAN_DEFAULT_ON", "1") != "0"
-SCAN_INTERVAL_SEC = _env_float("SCAN_INTERVAL_SEC", 60)          # أسرع ليلتقط العملات الجديدة
+SCAN_INTERVAL_SEC = _env_float("SCAN_INTERVAL_SEC", 90)          # أسرع ليلتقط العملات الجديدة
 SCAN_HEARTBEAT_H = _env_float("SCAN_HEARTBEAT_H", 3)
 SCAN_CYCLE_TIMEOUT = _env_float("SCAN_CYCLE_TIMEOUT", 170)        # لا تتجاوز الدورة هذا الحد أبداً
 # مسار العملات المُثبّتة (جديدة نسبياً وكبيرة)
@@ -2546,7 +2553,7 @@ GUARD_INTERVAL_SEC = _env_float("GUARD_INTERVAL_SEC", 25)               # حار
 GUARD_LIQ_DROP_PCT = _env_float("GUARD_LIQ_DROP_PCT", 35)               # سحب سيولة بعد الدخول
 GUARD_FLASH_PCT = _env_float("GUARD_FLASH_PCT", 30)                     # هبوط حاد خلال 4 دقائق
 SCAN_RUG_PER_CYCLE = int(_env_float("SCAN_RUG_PER_CYCLE", 16))
-SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 18))
+SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 14))
 SCAN_MAX_DISCOVER = 300
 SCAN_MAX_FETCH = 340
 NURSERY_H = _env_float("NURSERY_H", 3)            # ساعات بقاء العملة الجديدة في الحضانة اللحظية
@@ -2706,8 +2713,8 @@ def bounce_prescreen(m: dict) -> float:
 def alpha_ok(m: dict) -> bool:
     """زخم حقيقي لعملة ناشئة: صعود 5د و1س، مشترون يسيطرون، وتداول فعلي. (تراجع الفوليوم/الرسوم لا يمنعها)."""
     txn5 = (m.get("buys5") or 0) + (m.get("sells5") or 0)
-    return (m["chg5"] >= ALPHA_MIN_CHG5 and ALPHA_MIN_CHG1 <= m["chg1"] <= ALPHA_MAX_CHG1
-            and m["buy_ratio5"] >= ALPHA_MIN_BUY and (txn5 >= ALPHA_MIN_TXN5 or txn5 == 0))
+    return (m["chg5"] >= ALPHA_MIN_CHG5 - rx(0, 2, 4, 6) and ALPHA_MIN_CHG1 <= m["chg1"] <= ALPHA_MAX_CHG1
+            and m["buy_ratio5"] >= ALPHA_MIN_BUY - rx(0, 0.02, 0.04, 0.05) and (txn5 >= ALPHA_MIN_TXN5 or txn5 == 0))
 
 
 def alpha_prescreen(m: dict) -> float:
@@ -2838,8 +2845,9 @@ def scan_header(label: str, regime: dict) -> str:
     extra = ""
     if regime.get("up1") is not None:
         extra = f" (صاعد {regime['up1']:.0%} من {regime['n']} عملة، وسيط 1س {regime['med1']:+.1f}%)"
+    tier = ("" if RELAX == 0 else f"⚙️ مستوى الصيد: موسّع {RELAX}/3 (لا صفقات منذ فترة — شروط أخف قليلاً، قلّل الحجم)\n")
     return (f"🤖 <b>صفقة من مسح السوق — {label}</b>\nنوع السوق الآن: {st}{extra}\n"
-            f"{SCAN_STRATEGY.get(regime['state'], '')}\n\n")
+            f"{SCAN_STRATEGY.get(regime['state'], '')}\n{tier}\n")
 
 
 def record_auto(bd: dict, it: dict, m: dict, sec: Optional["Security"], kind: str, score, grade: str,
@@ -2998,10 +3006,15 @@ async def _vet(client: httpx.AsyncClient, mint: str, m: dict, u: dict, st: dict)
 
 
 async def scan_cycle(app: Application) -> dict:
+    global RELAX
     bd = app.bot_data
     sc = bd["scan"]
     client = bd.get("http_scan") or bd["http"]
     chat = sc["chat"]
+    _al = [t for t in (sc.get("alerts") or []) if time.time() - t < 86400]
+    idle_min = (time.time() - max(_al + [sc.setdefault("boot", time.time())])) / 60
+    RELAX = 0 if idle_min < RELAX_MIN[0] else 1 if idle_min < RELAX_MIN[1] else 2 if idle_min < RELAX_MIN[2] else 3
+    sc["idle_min"] = idle_min
     t0 = now = time.time()
     st = {"ts": now, "sources": {}, "discovered": 0, "metrics": 0, "alpha": 0, "est": 0, "filter": {}, "vetted": 0,
           "vet_fail": 0, "candles": 0, "setups": 0, "alerts": 0, "skipped": {}, "regime": None, "phases": {},
@@ -3137,6 +3150,8 @@ async def scan_cycle(app: Application) -> dict:
         except Exception:
             candles = []
         st["candles"] += 1
+        if not candles:
+            st["candle_fail"] = st.get("candle_fail", 0) + 1
         sent = False
         try:
             if lanes.get(mint) == "alpha":
@@ -3181,7 +3196,8 @@ async def scan_send_bounce(app, sc: dict, u: dict, m: dict, setup: dict, candles
     if not ok:
         return False
     risk_b = setup["entry"] - setup["sl"]
-    if risk_b <= 0 or risk_b / setup["entry"] > 0.13 or (setup["tp1"] - setup["entry"]) / risk_b < 1.1:
+    if (risk_b <= 0 or risk_b / setup["entry"] > rx(0.13, 0.15, 0.17, 0.18)
+            or (setup["tp1"] - setup["entry"]) / risk_b < rx(1.1, 1.05, 1.0, 0.95)):
         qnote(sc, "ارتداد: عائد/مخاطرة ضعيف")
         return False
     ef_b = {"pull": max(0.0, 1 - m["price"] / setup["peak"]) if setup.get("peak") else 0.1, "pat": "BOUNCE"}
@@ -3219,12 +3235,12 @@ async def scan_send_momentum(app, sc: dict, u: dict, m: dict, candles: list, reg
         qnote(sc, ef["code"])
         return False
     plan = make_dip_plan(m, candles, ef)
-    if plan.rr1 < Q_MIN_RR1:
+    if plan.rr1 < rx(Q_MIN_RR1, 1.05, 1.0, 0.9):
         qnote(sc, "عائد/مخاطرة ضعيف")
         return False
     score, b = compute_score(m, u["sec_obj"], plan)
     need = SCAN_MIN_SCORE + (0 if regime["state"] == "hot" else 5)
-    if score < need:
+    if score < need - rx(0, 5, 10, 15):
         qnote(sc, "تقييم منخفض")
         return False
     lvl, rtxt, ok = scan_risk_gate(sc, u, m)
@@ -3261,11 +3277,11 @@ async def scan_send_alpha(app, sc: dict, u: dict, m: dict, candles: list, regime
             shadow_add(sc, m, m["price"], m["price"] * 0.90, m["price"] * 1.12, learn_feats(m, ef, "low", regime, "ALPHA"), "rej")
         return False
     plan = make_dip_plan(m, candles, ef)
-    if plan.rr1 < Q_MIN_RR1:
+    if plan.rr1 < rx(Q_MIN_RR1, 1.05, 1.0, 0.9):
         qnote(sc, "عائد/مخاطرة ضعيف")
         return False
     score, b = compute_score(m, u["sec_obj"], plan)
-    if score < ALPHA_MIN_SCORE:
+    if score < ALPHA_MIN_SCORE - rx(0, 5, 10, 15):
         qnote(sc, "تقييم منخفض")
         return False
     lvl, rtxt, ok = scan_risk_gate(sc, u, m)
@@ -3299,6 +3315,20 @@ async def scan_send_alpha(app, sc: dict, u: dict, m: dict, candles: list, regime
     record_auto(bd, it, m, u["sec_obj"], "AUTOM", score, "", plan.entry, plan.sl, plan.tp1, plan.tp2,
                 f"عملة ناشئة بعد تصحيح (مخاطرة {lvl}, p={p:.2f})")
     return True
+
+
+def scan_diag_text(sc: dict) -> str:
+    st = sc.get("last") or {}
+    qs = sc.get("qstats") or {}
+    sk = st.get("skipped") or {}
+    fl = st.get("filter") or {}
+    top = lambda d: "، ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:5]) or "—"
+    return (f"🔍 <b>تشخيص: لا صفقات منذ {int(sc.get('idle_min', 0))} دقيقة</b> (المسح حيّ)\n"
+            f"• اكتُشف {st.get('discovered', 0)} • مسار ناشئ {st.get('alpha', 0)} / مُثبّت {st.get('est', 0)} • "
+            f"سليمة أمنياً {st.get('vetted', 0)}\n"
+            f"• شموع جُلبت {st.get('candles', 0)} (فشلت {st.get('candle_fail', 0)}) • أنماط ظهرت {st.get('setups', 0)}\n"
+            f"• رفض هيكل الدخول: {top(qs)}\n• تصفية أولية: {top(fl)}\n• تخطّي: {top(sk)}\n"
+            f"⚙️ مستوى الصيد الآن: {RELAX}/3 (يتوسع تلقائياً مع الصمت)")
 
 
 def scan_status_text(sc: dict) -> str:
@@ -3351,6 +3381,7 @@ def scan_status_text(sc: dict) -> str:
         lines.append("🚫 رُفضت بفلتر الجودة: " + "، ".join(f"{k} {v}" for k, v in sorted(qs.items(), key=lambda kv: -kv[1])[:6]))
     rg_state = (sc.get("regime") or {}).get("state", "unknown")
     lines.append(SCAN_STRATEGY.get(rg_state, ""))
+    lines.append(f"⚙️ مستوى الصيد: {RELAX}/3 • دقائق منذ آخر صفقة: {int(sc.get('idle_min', 0))}")
     lines.append(f"🍼 حضانة العملات الجديدة: {len(sc.get('nur') or {})} عملة تحت المراقبة اللحظية")
     uni = sc.get("uni") or {}
     vet = sum(1 for u in uni.values() if u.get("sec_ok"))
@@ -3364,6 +3395,15 @@ async def scan_loop(app: Application) -> None:
     GECKO_LANE.set("scan")
     await asyncio.sleep(20)
     await restore_state(app)
+    _sc0 = app.bot_data.get("scan") or {}
+    if _sc0.get("chat") and _sc0.get("on"):
+        try:
+            await app.bot.send_message(
+                chat_id=_sc0["chat"],
+                text=(f"🟢 البوت يعمل الآن (v5.5) — صفقات مفتوحة مستعادة: {len(_sc0.get('pos') or {})} • "
+                      f"نتائج تعلّم محفوظة: {LEARN['w'] + LEARN['l']}"))
+        except Exception:
+            log.exception("boot notice failed")
     await asyncio.sleep(10)
     while True:
         sc = app.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
@@ -3373,6 +3413,13 @@ async def scan_loop(app: Application) -> None:
                 await asyncio.wait_for(scan_cycle(app), timeout=SCAN_CYCLE_TIMEOUT)
                 sc["ok_ts"] = time.time()
                 sc["fails"] = 0
+                if (not first and sc.get("idle_min", 0) >= 50 and time.time() - sc.get("diag_ts", 0) > 3600):
+                    sc["diag_ts"] = time.time()
+                    try:
+                        await app.bot.send_message(chat_id=sc["chat"], text=scan_diag_text(sc), parse_mode=ParseMode.HTML)
+                        sc["qstats"] = {}
+                    except Exception:
+                        log.exception("scan diag failed")
                 if first or time.time() - sc.get("hb_ts", 0) > SCAN_HEARTBEAT_H * 3600:
                     sc["hb_ts"] = time.time()
                     head = ("✅ <b>بدأ مسح السوق 24/24</b> — يعمل وحده ويرسل الصفقات هنا.\n\n" if first
@@ -4753,7 +4800,7 @@ async def run_all() -> None:
     scanner = asyncio.create_task(supervised("scan", scan_loop, app))
     guard = asyncio.create_task(supervised("guard", scan_guard_loop, app))
     dog = asyncio.create_task(watchdog_loop(app))
-    log.info("SolAlpha Sniper v5.4 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    log.info("SolAlpha Sniper v5.5 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
