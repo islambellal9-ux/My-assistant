@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper v5.0 — Telegram bot (v4.4 + مسح سوق 24/24 مستقل: عملات ناشئة + مُثبّتة + تنظيف تلقائي) (Render Web Service)
+SolAlpha Sniper v5.2 — Telegram bot (v5.1 + تدفق إشارات مكثف + حضانة العملات الجديدة + استراتيجية حسب السوق + عزل تام للمسح) (Render Web Service)
 مصدر العملات: قناة الإشارات https://t.me/solhousesignal حصرياً.
 طريقة القراءة (بالترتيب): 0) الوضع اليدوي: ترسل للبوت عقوداً أو تحوّل (Forward) رسائل الإشارات فيحللها /best (لا يحتاج أي إعداد)
                           1) Telethon بجلسة مستخدم (TELETHON_SESSION) — الأوثق
@@ -29,6 +29,7 @@ SolAlpha Sniper v5.0 — Telegram bot (v4.4 + مسح سوق 24/24 مستقل: ع
 """
 
 import asyncio
+import contextvars
 import html
 import io
 import json
@@ -227,18 +228,23 @@ def api_status_text() -> str:
     return "\n".join(lines) if lines else "• لا توجد معلومات عن حالة المصادر بعد"
 
 
-GECKO_MIN_GAP = _env_float("GECKO_MIN_GAP", 2.1)       # ثوانٍ بين أي طلبين لـ GeckoTerminal (الحد 30/د)
-_GECKO: dict = {"lock": None, "last": 0.0}
+GECKO_MIN_GAP = _env_float("GECKO_MIN_GAP", 3.0)       # ثوانٍ بين طلبين لـ GeckoTerminal في قناة الأوامر/المراقبة (الحد العام 30/د)
+GECKO_SCAN_GAP = _env_float("GECKO_SCAN_GAP", 2.6)     # قناة مسح السوق: طابور ومؤقّت مستقلان تماماً
+GECKO_LANE = contextvars.ContextVar("gecko_lane", default="main")   # "scan" تُضبط داخل حلقات المسح فقط
+_GECKO: dict = {}
 
 
 async def _gecko_wait() -> None:
-    if _GECKO["lock"] is None:
-        _GECKO["lock"] = asyncio.Lock()
-    async with _GECKO["lock"]:
-        gap = time.time() - _GECKO["last"]
-        if gap < GECKO_MIN_GAP:
-            await asyncio.sleep(GECKO_MIN_GAP - gap)
-        _GECKO["last"] = time.time()
+    lane = GECKO_LANE.get()
+    st = _GECKO.setdefault(lane, {"lock": None, "last": 0.0})
+    if st["lock"] is None:
+        st["lock"] = asyncio.Lock()
+    need = GECKO_SCAN_GAP if lane == "scan" else GECKO_MIN_GAP
+    async with st["lock"]:
+        gap = time.time() - st["last"]
+        if gap < need:
+            await asyncio.sleep(need - gap)
+        st["last"] = time.time()
 
 
 async def fetch_json(
@@ -1622,7 +1628,7 @@ WELCOME = (
 )
 
 HELP = (
-    "🤖 <b>مسح السوق 24/24</b> يعمل تلقائياً ومستقلاً عن قائمتك: يلتقط العملات الناشئة (دقائق، MC 30–250K) والمُثبّتة بفحص أمني صارم وزخم حقيقي ويرسل الصفقات بحسب نوع السوق. القائمة تُنظَّف تلقائياً من العملات المنهارة/المشبوهة. /scan الحالة، /scan_now فحص فوري، /scan_off إيقاف، /scan_on لتحويله إلى محادثة/مجموعة أخرى.\n\n"
+    "🤖 <b>مسح السوق 24/24</b> يعمل تلقائياً ومستقلاً عن قائمتك: يلتقط العملات الناشئة (دقائق، MC 30–250K) والمُثبّتة بفحص أمني صارم وزخم حقيقي ويرسل الصفقات بحسب نوع السوق. القائمة تُنظَّف تلقائياً من العملات المنهارة/المشبوهة. كل صفقة تحمل «مخاطرة Rug» (نشاط متراجع، مالكون قليلون، صعود قطعي، سيولة رقيقة) مع خروج سريع TP0، وحارس يراقب الصفقات المفتوحة كل 25 ثانية وينبّه فوراً عند سحب السيولة. /scan الحالة، /scan_now فحص فوري، /scan_off إيقاف، /scan_on لتحويله إلى محادثة/مجموعة أخرى.\n\n"
     "📤 <b>/export</b>: ملف شموع الدقيقة والإشارات لمعايرة كاشف الارتداد على كل عملاتك (أرسله لي).\n\n"
     "📍 <b>الدعم</b>: كل ارتداد مؤكد يُرسل لك كما هو، ويُوسم بقوة الدعم (✅ قوي / ⚠️ ضعيف) مع أقرب دعم تحته، وأنبّهك عند اقتراب السعر من دعم قوي. "
     "العملات لا تُحذف من القائمة تلقائياً إلا بانتهاء المدة (8 ساعات).\n\n"
@@ -1645,10 +1651,15 @@ HELP = (
 
 
 async def post_init(application: Application) -> None:
+    hdrs = {"User-Agent": "SolAlphaSniper/5.2", "Accept": "application/json"}
     application.bot_data["http"] = httpx.AsyncClient(
-        timeout=httpx.Timeout(12.0),
-        headers={"User-Agent": "SolAlphaSniper/5.0", "Accept": "application/json"},
-        follow_redirects=True,
+        timeout=httpx.Timeout(12.0, pool=20.0), headers=hdrs, follow_redirects=True,
+        limits=httpx.Limits(max_connections=40, max_keepalive_connections=15),
+    )
+    # مجمّع اتصالات مستقل بالكامل لمسح السوق وحارس الصفقات: لا يتزاحم مع الأوامر ولا مع قائمة المراقبة
+    application.bot_data["http_scan"] = httpx.AsyncClient(
+        timeout=httpx.Timeout(12.0, pool=20.0), headers=hdrs, follow_redirects=True,
+        limits=httpx.Limits(max_connections=40, max_keepalive_connections=15),
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
     application.bot_data["cooldowns"] = {}
@@ -1660,9 +1671,13 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    client = application.bot_data.get("http")
-    if client:
-        await client.aclose()
+    for key in ("http", "http_scan"):
+        client = application.bot_data.get(key)
+        if client:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
     if TL.get("client"):
         try:
             await TL["client"].disconnect()
@@ -2150,7 +2165,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 SCAN_STATE_FILE = os.getenv("SCAN_STATE_FILE", "scan_state.json")
 SCAN_CHAT_ID = int(os.getenv("SCAN_CHAT_ID", "0") or 0)
 SCAN_DEFAULT_ON = os.getenv("SCAN_DEFAULT_ON", "1") != "0"
-SCAN_INTERVAL_SEC = _env_float("SCAN_INTERVAL_SEC", 120)          # أسرع ليلتقط العملات الجديدة
+SCAN_INTERVAL_SEC = _env_float("SCAN_INTERVAL_SEC", 60)          # أسرع ليلتقط العملات الجديدة
 SCAN_HEARTBEAT_H = _env_float("SCAN_HEARTBEAT_H", 3)
 SCAN_CYCLE_TIMEOUT = _env_float("SCAN_CYCLE_TIMEOUT", 170)        # لا تتجاوز الدورة هذا الحد أبداً
 # مسار العملات المُثبّتة (جديدة نسبياً وكبيرة)
@@ -2162,28 +2177,41 @@ SCAN_MIN_AGE_MIN = _env_float("SCAN_MIN_AGE_MIN", 30)
 SCAN_MAX_AGE_H = _env_float("SCAN_MAX_AGE_H", 72)
 # مسار العملات الناشئة (دقائق معدودة، ماركت كاب صغير)
 ALPHA_ON = os.getenv("ALPHA_ON", "1") != "0"
-ALPHA_MIN_AGE_MIN = _env_float("ALPHA_MIN_AGE_MIN", 3)
+ALPHA_MIN_AGE_MIN = _env_float("ALPHA_MIN_AGE_MIN", 1)
 ALPHA_MAX_AGE_MIN = _env_float("ALPHA_MAX_AGE_MIN", 240)
 ALPHA_MIN_MC = _env_float("ALPHA_MIN_MC", 30_000)
 ALPHA_MAX_MC = _env_float("ALPHA_MAX_MC", 250_000)
-ALPHA_MIN_LIQ = _env_float("ALPHA_MIN_LIQ", 7_000)
-ALPHA_MIN_VOL1H = _env_float("ALPHA_MIN_VOL1H", 4_000)
-ALPHA_MIN_TXN5 = _env_float("ALPHA_MIN_TXN5", 15)
-ALPHA_MIN_CHG5 = _env_float("ALPHA_MIN_CHG5", 2.0)
-ALPHA_MIN_CHG1 = _env_float("ALPHA_MIN_CHG1", 8.0)
+ALPHA_MIN_LIQ = _env_float("ALPHA_MIN_LIQ", 5_000)
+ALPHA_MIN_VOL1H = _env_float("ALPHA_MIN_VOL1H", 2_000)
+ALPHA_MIN_TXN5 = _env_float("ALPHA_MIN_TXN5", 8)
+ALPHA_MIN_CHG5 = _env_float("ALPHA_MIN_CHG5", 1.0)
+ALPHA_MIN_CHG1 = _env_float("ALPHA_MIN_CHG1", 4.0)
 ALPHA_MAX_CHG1 = _env_float("ALPHA_MAX_CHG1", 250.0)
-ALPHA_MIN_BUY = _env_float("ALPHA_MIN_BUY", 0.55)
-ALPHA_MIN_SCORE = int(_env_float("ALPHA_MIN_SCORE", 55))
+ALPHA_MIN_BUY = _env_float("ALPHA_MIN_BUY", 0.52)
+ALPHA_MIN_SCORE = int(_env_float("ALPHA_MIN_SCORE", 0))     # 0 = التقييم وسم فقط لا بوابة (الحظر الصلب وحده يمنع)
 # أمان وسقوف
 SCAN_MAX_TOP10 = _env_float("SCAN_MAX_TOP10", 35)
-SCAN_MAX_ALERTS_HOUR = int(_env_float("SCAN_MAX_ALERTS_HOUR", 4))
-SCAN_COIN_COOLDOWN_H = _env_float("SCAN_COIN_COOLDOWN_H", 4)
-SCAN_RUG_PER_CYCLE = int(_env_float("SCAN_RUG_PER_CYCLE", 8))
-SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 8))
-SCAN_MAX_DISCOVER = 240
+SCAN_MAX_ALERTS_HOUR = int(_env_float("SCAN_MAX_ALERTS_HOUR", 20))
+SCAN_COIN_COOLDOWN_H = _env_float("SCAN_COIN_COOLDOWN_H", 1)
+SCAN_MAX_HIGHRISK_HOUR = int(_env_float("SCAN_MAX_HIGHRISK_HOUR", 99))   # صفقات "مخاطرة Rug عالية" بالساعة
+ALPHA_MIN_HOLDERS = _env_float("ALPHA_MIN_HOLDERS", 0)                 # عدد مالكين أدنى (من RugCheck)
+RISK_HIGH_PTS = int(_env_float("RISK_HIGH_PTS", 5))
+RISK_MED_PTS = int(_env_float("RISK_MED_PTS", 3))
+GUARD_INTERVAL_SEC = _env_float("GUARD_INTERVAL_SEC", 25)               # حارس الصفقات المفتوحة
+GUARD_LIQ_DROP_PCT = _env_float("GUARD_LIQ_DROP_PCT", 35)               # سحب سيولة بعد الدخول
+GUARD_FLASH_PCT = _env_float("GUARD_FLASH_PCT", 30)                     # هبوط حاد خلال 4 دقائق
+SCAN_RUG_PER_CYCLE = int(_env_float("SCAN_RUG_PER_CYCLE", 16))
+SCAN_CANDLES_PER_CYCLE = int(_env_float("SCAN_CANDLES_PER_CYCLE", 14))
+SCAN_MAX_DISCOVER = 300
+SCAN_MAX_FETCH = 340
+NURSERY_H = _env_float("NURSERY_H", 3)            # ساعات بقاء العملة الجديدة في الحضانة اللحظية
+NURSERY_MAX = int(_env_float("NURSERY_MAX", 160))
+# أسباب مؤقتة: تبقى العملة في الحضانة وتُعاد قراءتها كل دورة حتى تكبر وتدخل المسار
+NURSERY_KEEP = {"لم تهاجر", "سيولة ضعيفة (ناشئة)", "فوليوم ضعيف (ناشئة)", "ماركت كاب صغير", "حديثة جداً",
+                "سيولة ضعيفة", "فوليوم ضعيف", "عمر مجهول"}
 SCAN_UNIVERSE_H = 12
 SCAN_MOMENTUM = os.getenv("SCAN_MOMENTUM", "1") != "0"
-SCAN_MIN_SCORE = int(_env_float("SCAN_MIN_SCORE", 75))
+SCAN_MIN_SCORE = int(_env_float("SCAN_MIN_SCORE", 65))
 SCAN_REGIME_LABEL = {"hot": "🟢 صاعد", "neutral": "🟡 محايد", "bleeding": "🔴 نازف", "unknown": "⚪ غير كافٍ"}
 
 
@@ -2260,7 +2288,9 @@ async def discover_candidates(client: httpx.AsyncClient):
 
     tasks = [dex("dex_profiles", f"{DEX}/token-profiles/latest/v1"),
              dex("dex_boosts", f"{DEX}/token-boosts/latest/v1"),
-             dex("dex_boosts_top", f"{DEX}/token-boosts/top/v1")]
+             dex("dex_boosts_top", f"{DEX}/token-boosts/top/v1"),
+             dex("dex_takeovers", f"{DEX}/community-takeovers/latest/v1"),
+             dex("dex_ads", f"{DEX}/ads/latest/v1")]
     results = await asyncio.gather(*tasks, gecko_all(), return_exceptions=True)
     ordered = []
     for r in results:
@@ -2340,7 +2370,122 @@ def alpha_prescreen(m: dict) -> float:
 
 
 def scan_secure(sec: "Security") -> bool:
-    return bool(sec.passed and not sec.warnings and sec.top10 <= SCAN_MAX_TOP10 and (sec.dev is None or sec.dev <= 5))
+    """يمنع فقط الحظر الصلب (Mint/Freeze/LP/Rugged/Danger/حيتان حقيقيون). التحذيرات الناعمة تدخل في وسم المخاطرة."""
+    return bool(sec.passed)
+
+
+def rug_risk(m: dict, holders: Optional[float], sec: Optional["Security"] = None) -> tuple:
+    """درجة مخاطرة Rug بعوامل قابلة للتفسير. ترجع (مستوى، نقاط، أسباب)."""
+    pts, why = 0, []
+    pace = m.get("vol_pace", 1.0)
+    if pace < 0.3:
+        pts += 3
+        why.append(f"مؤشر النشاط F: حجم 5د ×{pace:.1f} من متوسط الساعة (ينهار)")
+    elif pace < 0.5:
+        pts += 2
+        why.append(f"مؤشر النشاط F: حجم 5د ×{pace:.1f} من متوسط الساعة (يتراجع)")
+    if 0 < m.get("h1_vs_h6", 1.0) < 0.7:
+        pts += 1
+        why.append("فوليوم الساعة أقل من متوسط 6 ساعات")
+    age = m.get("age_min") or 0
+    if age < 180 and m["chg1"] > 300:
+        pts += 3
+        why.append(f"صعود قطعي +{m['chg1']:.0f}% لعملة عمرها {age:.0f}د")
+    elif age < 180 and m["chg1"] > 150:
+        pts += 2
+        why.append(f"صعود حاد +{m['chg1']:.0f}% لعملة عمرها {age:.0f}د")
+    ratio = (m["liq"] / m["mcap"]) if m["mcap"] > 0 else 1.0
+    if ratio < 0.08:
+        pts += 2
+        why.append(f"سيولة رقيقة {ratio:.0%} من MC")
+    elif ratio < 0.12:
+        pts += 1
+        why.append(f"سيولة {ratio:.0%} من MC")
+    if holders is not None:
+        if holders < 100:
+            pts += 3
+            why.append(f"{holders:.0f} مالكاً فقط")
+        elif holders < 250 and m["mcap"] > 150_000:
+            pts += 1
+            why.append(f"{holders:.0f} مالكاً لماركت كاب {fmt_usd(m['mcap'])}")
+    if m["buy_ratio5"] > 0.88:
+        pts += 1
+        why.append("شراء مفرط مشبوه (نشاط مصطنع؟)")
+    txn5 = (m.get("buys5") or 0) + (m.get("sells5") or 0)
+    if m.get("vol5", 0) > 0 and txn5 < 8:
+        pts += 1
+        why.append(f"نشاط ضئيل: {txn5:.0f} صفقة فقط في 5د")
+    elif 1 <= txn5 < 15 and m.get("vol5", 0) / txn5 > 700:
+        pts += 1
+        why.append("حجم كبير بعدد صفقات قليل (نشاط مشبوه؟)")
+    if sec is not None:
+        if sec.bundled:
+            pts += 2
+            why.append("أنماط Bundled/Insider")
+        if sec.top10 > MAX_TOP10_PCT:
+            pts += 1
+            why.append(f"Top10 {sec.top10:.0f}%")
+        if sec.dev is not None and sec.dev > MAX_DEV_PCT:
+            pts += 1
+            why.append(f"Dev {sec.dev:.1f}%")
+        if sec.rug_norm is not None and sec.rug_norm > RUGCHECK_MAX_NORM:
+            pts += 1
+            why.append(f"RugCheck {sec.rug_norm:.0f}/100")
+    lvl = "high" if pts >= RISK_HIGH_PTS else "med" if pts >= RISK_MED_PTS else "low"
+    return lvl, pts, why
+
+
+def risk_text(lvl: str, pts: int, why: list) -> str:
+    icon = {"high": "🔴 عالية", "med": "🟡 متوسطة", "low": "🟢 منخفضة"}[lvl]
+    tag = ("\n🚨 <b>HIGH RISK ALERT</b> — اجتازت الفحص الأمني الصلب لكن مؤشرات النشاط/المخاطر مشبوهة. "
+           "القرار لك: حجم صغير + خروج سريع.") if lvl == "high" else ""
+    return f"☠️ <b>مخاطرة Rug: {icon}</b> ({pts} نقطة)" + (" — " + "، ".join(why) if why else "") + tag
+
+
+def tighten_plan(plan, max_risk: float = 0.10) -> None:
+    """للعملات عالية المخاطرة: وقف أضيق (حتى −10%) مع إعادة حساب R:R."""
+    try:
+        if plan.entry > 0 and (plan.entry - plan.sl) / plan.entry > max_risk:
+            plan.sl = plan.entry * (1 - max_risk)
+            plan.risk_pct = max_risk * 100
+            risk = plan.entry - plan.sl
+            plan.rr1 = (plan.tp1 - plan.entry) / risk
+            plan.rr2 = (plan.tp2 - plan.entry) / risk
+    except Exception:
+        log.exception("tighten_plan failed")
+
+
+def scan_risk_gate(sc: dict, u: dict, m: dict):
+    """يحسب المخاطرة ويطبّق سقف الصفقات عالية المخاطرة. يرجع (مستوى، نص، مسموح؟)."""
+    lvl, pts, why = rug_risk(m, u.get("holders"), u.get("sec_obj"))
+    now = time.time()
+    sc["hr"] = [t for t in sc.get("hr", []) if now - t < 3600]
+    if lvl == "high" and len(sc["hr"]) >= SCAN_MAX_HIGHRISK_HOUR:
+        return lvl, risk_text(lvl, pts, why), False
+    return lvl, risk_text(lvl, pts, why), True
+
+
+def tp0_for(lvl: str, entry: float, regime: Optional[dict] = None) -> Optional[float]:
+    bleeding = bool(regime and regime.get("state") == "bleeding")
+    if lvl == "low" and not bleeding:
+        return None
+    return entry * (1.08 if lvl == "high" else 1.10)
+
+
+def quick_exit_line(lvl: str, entry: float, regime: Optional[dict] = None) -> str:
+    if lvl == "low" and not (regime and regime.get("state") == "bleeding"):
+        return ""
+    pct = 8 if lvl == "high" else 10
+    return (f"⚡ <b>خروج سريع (TP0)</b>: {fmt_price(entry * (1 + pct / 100))} (+{pct}%) ثم انقل الوقف للدخول — "
+            "النشاط المتراجع قد ينتهي بـRug بعد القمة.\n")
+
+
+SCAN_STRATEGY = {
+    "hot": "🚀 الاستراتيجية الآن: زخم مبكر — ركوب الموجة وأهداف أوسع",
+    "neutral": "⚡ الاستراتيجية الآن: سكالبيج/ارتداد — دخول عند الدعم وجني سريع",
+    "bleeding": "🛡️ الاستراتيجية الآن: دفاعية — صفقات مبكرة/ارتداد مؤكد، وقف أضيق وخروج سريع TP0",
+    "unknown": "⚪ الاستراتيجية الآن: متوازنة (بيانات السوق غير كافية بعد)",
+}
 
 
 def scan_header(label: str, regime: dict) -> str:
@@ -2348,7 +2493,8 @@ def scan_header(label: str, regime: dict) -> str:
     extra = ""
     if regime.get("up1") is not None:
         extra = f" (صاعد {regime['up1']:.0%} من {regime['n']} عملة، وسيط 1س {regime['med1']:+.1f}%)"
-    return f"🤖 <b>صفقة من مسح السوق — {label}</b>\nنوع السوق الآن: {st}{extra}\n\n"
+    return (f"🤖 <b>صفقة من مسح السوق — {label}</b>\nنوع السوق الآن: {st}{extra}\n"
+            f"{SCAN_STRATEGY.get(regime['state'], '')}\n\n")
 
 
 def record_auto(bd: dict, it: dict, m: dict, sec: Optional["Security"], kind: str, score, grade: str,
@@ -2376,9 +2522,11 @@ def scan_can_alert(sc: dict, mint: str, now: float):
     return True, ""
 
 
-def _add_pos(sc: dict, m: dict, kind: str, entry: float, sl: float, tp1: float, tp2: float) -> None:
+def _add_pos(sc: dict, m: dict, kind: str, entry: float, sl: float, tp1: float, tp2: float,
+             tp0: Optional[float] = None) -> None:
     sc.setdefault("pos", {})[m["mint"]] = {"sym": m["symbol"], "kind": kind, "entry": entry, "sl": sl, "tp1": tp1,
-                                           "tp2": tp2, "ts": time.time(), "hit1": False}
+                                           "tp2": tp2, "ts": time.time(), "hit1": False, "tp0": tp0, "hit0": False,
+                                           "entry_liq": m["liq"], "peak_liq": m["liq"], "ph": []}
 
 
 async def scan_track_positions(app: Application, sc: dict, metrics: dict) -> None:
@@ -2410,6 +2558,70 @@ async def scan_track_positions(app: Application, sc: dict, metrics: dict) -> Non
             log.exception("scan position notice failed")
 
 
+async def scan_guard_cycle(app: Application) -> None:
+    """يراقب الصفقات المفتوحة كل ~25ث: سحب سيولة، هبوط حاد، TP0/TP1/TP2/SL — وينبّه فوراً."""
+    bd = app.bot_data
+    sc = bd.get("scan") or {}
+    pos = sc.get("pos") or {}
+    chat = sc.get("chat")
+    if not pos or not chat:
+        return
+    sink: dict = {}
+    try:
+        await asyncio.wait_for(fetch_pairs(bd.get("http_scan") or bd["http"], list(pos), (), sink, True), timeout=25)
+    except asyncio.TimeoutError:
+        pass
+    metrics = {}
+    for p in sink.values():
+        mm = extract_metrics(p)
+        if mm:
+            metrics[mm["mint"]] = mm
+    now = time.time()
+    for mint, p in list(pos.items()):
+        m = metrics.get(mint)
+        if not m or m["price"] <= 0:
+            continue
+        p["peak_liq"] = max(p.get("peak_liq", m["liq"]), m["liq"])
+        ph = p.setdefault("ph", [])
+        ph.append([now, m["price"]])
+        del ph[:-12]
+        reason = None
+        if p["peak_liq"] > 0 and m["liq"] <= p["peak_liq"] * (1 - GUARD_LIQ_DROP_PCT / 100):
+            reason = f"السيولة هبطت {(1 - m['liq'] / p['peak_liq']) * 100:.0f}% ({fmt_usd(p['peak_liq'])} ← {fmt_usd(m['liq'])})"
+        recent = [x for t, x in ph if now - t <= 240]
+        if not reason and recent and m["price"] <= max(recent) * (1 - GUARD_FLASH_PCT / 100):
+            reason = f"هبوط {(1 - m['price'] / max(recent)) * 100:.0f}% خلال 4 دقائق"
+        try:
+            if reason:
+                pos.pop(mint, None)
+                await app.bot.send_message(
+                    chat_id=chat, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                    text=f"🚨 <b>{html.escape(p['sym'])}</b> (مسح السوق): {html.escape(reason)} — شبهة سحب/Rug. "
+                         f"اخرج الآن إن كنت داخل الصفقة.\n<code>{mint}</code>")
+            elif p.get("tp0") and not p.get("hit0") and m["price"] >= p["tp0"]:
+                p["hit0"] = True
+                await app.bot.send_message(
+                    chat_id=chat, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                    text=f"⚡ <b>{html.escape(p['sym'])}</b> (مسح السوق): تحقق TP0 ({fmt_price(p['tp0'])}) — "
+                         "فكّر بجني جزء/الخروج وانقل الوقف للدخول.")
+        except Exception:
+            log.exception("guard notice failed")
+    await scan_track_positions(app, sc, metrics)
+
+
+async def scan_guard_loop(app: Application) -> None:
+    GECKO_LANE.set("scan")
+    await asyncio.sleep(40)
+    while True:
+        try:
+            await asyncio.wait_for(scan_guard_cycle(app), timeout=60)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("scan guard failed")
+        await asyncio.sleep(GUARD_INTERVAL_SEC)
+
+
 async def _vet(client: httpx.AsyncClient, mint: str, m: dict, u: dict, st: dict) -> None:
     try:
         report = await asyncio.wait_for(get_rugcheck_report(client, mint), timeout=45)
@@ -2417,13 +2629,23 @@ async def _vet(client: httpx.AsyncClient, mint: str, m: dict, u: dict, st: dict)
         report = None
     if not report:
         u["tries"] += 1
-        if u["tries"] >= 6:
+        u["retry_at"] = time.time() + 60
+        if u["tries"] >= 10:
             u["sec_ok"], u["sec_txt"] = False, "تعذر جلب تقرير RugCheck"
             st["vet_fail"] += 1
         return
     sec = analyze_security(report, m["pair"])
     st["vetted"] += 1
+    th = report.get("totalHolders")
+    u["holders"] = float(th) if isinstance(th, (int, float)) else None
     ok = scan_secure(sec)
+    if (not ok and sec.reasons and all(r.startswith("تعذر") for r in sec.reasons)
+            and u.get("vet_retry", 0) < 5 and (m.get("age_min") or 0) < 180):
+        # عملة حديثة: بيانات RugCheck لم تكتمل بعد → نعيد الفحص بعد دقيقة ونصف بدل الرفض النهائي
+        u["vet_retry"] = u.get("vet_retry", 0) + 1
+        u["retry_at"] = time.time() + 75
+        u["sec_ok"], u["sec_txt"] = None, "بانتظار اكتمال بيانات RugCheck"
+        return
     u["sec_ok"], u["sec_obj"], u["sec_txt"] = ok, sec, sec_brief(sec)
     if not ok:
         st["vet_fail"] += 1
@@ -2432,12 +2654,14 @@ async def _vet(client: httpx.AsyncClient, mint: str, m: dict, u: dict, st: dict)
 async def scan_cycle(app: Application) -> dict:
     bd = app.bot_data
     sc = bd["scan"]
-    client = bd["http"]
+    client = bd.get("http_scan") or bd["http"]
     chat = sc["chat"]
     t0 = now = time.time()
     st = {"ts": now, "sources": {}, "discovered": 0, "metrics": 0, "alpha": 0, "est": 0, "filter": {}, "vetted": 0,
-          "vet_fail": 0, "candles": 0, "setups": 0, "alerts": 0, "skipped": {}, "regime": None, "phases": {}}
+          "vet_fail": 0, "candles": 0, "setups": 0, "alerts": 0, "skipped": {}, "regime": None, "phases": {},
+          "nursery": 0}
     uni: dict = sc.setdefault("uni", {})
+    nur: dict = sc.setdefault("nur", {})      # الحضانة: كل عملة جديدة تبقى تحت المراقبة اللحظية
 
     # 1) اكتشاف (مصادر متوازية، لا يوقفه فشل أي مصدر)
     try:
@@ -2447,11 +2671,14 @@ async def scan_cycle(app: Application) -> dict:
         addrs, st["sources"] = [], {}
     addrs = [a for a in addrs if is_valid_solana_address(a) and a not in EXCLUDED_MINTS][:SCAN_MAX_DISCOVER]
     st["discovered"] = len(addrs)
+    for a in addrs:
+        nur.setdefault(a, now)
     st["phases"]["discover"] = round(time.time() - t0, 1)
 
     # 2) بيانات السوق: المكتشف + الكون + صفقات المسح المفتوحة
     t1 = time.time()
-    all_addrs = list(dict.fromkeys(addrs + list(uni) + list((sc.get("pos") or {}))))[:260]
+    all_addrs = list(dict.fromkeys(addrs + sorted(nur, key=nur.get, reverse=True) + list(uni)
+                                   + list((sc.get("pos") or {}))))[:SCAN_MAX_FETCH]
     sink: dict = {}
     if all_addrs:
         try:
@@ -2475,7 +2702,10 @@ async def scan_cycle(app: Application) -> dict:
         if not lane:
             reasons[why] += 1
             uni.pop(mint, None)
+            if why not in NURSERY_KEEP or (m.get("age_min") or 0) > ALPHA_MAX_AGE_MIN:
+                nur.pop(mint, None)           # سبب دائم → خرجت من الحضانة
             continue
+        nur.pop(mint, None)                   # دخلت المسار → تُدار من الكون
         lanes[mint] = lane
         u = uni.setdefault(mint, {"added": now, "sec_ok": None, "sec_obj": None, "sec_txt": "", "tries": 0,
                                   "candle_ts": 0.0, "sym": m["symbol"]})
@@ -2486,6 +2716,13 @@ async def scan_cycle(app: Application) -> dict:
             uni[mint]["miss"] = uni[mint].get("miss", 0) + 1
         if now - uni[mint]["added"] > SCAN_UNIVERSE_H * 3600 or uni[mint].get("miss", 0) >= 3:
             uni.pop(mint, None)
+    for mint, ts in list(nur.items()):
+        if now - ts > NURSERY_H * 3600 or (mint not in metrics and now - ts > 2400):
+            nur.pop(mint, None)
+    if len(nur) > NURSERY_MAX:
+        for mint in sorted(nur, key=nur.get)[:len(nur) - NURSERY_MAX]:
+            nur.pop(mint, None)
+    st["nursery"] = len(nur)
     st["alpha"] = sum(1 for v in lanes.values() if v == "alpha")
     st["est"] = sum(1 for v in lanes.values() if v == "est")
     st["filter"] = dict(reasons)
@@ -2496,7 +2733,7 @@ async def scan_cycle(app: Application) -> dict:
 
     # 4) فحص أمني أصرم متوازٍ (دفعة صغيرة + مهلة)، الناشئة أولاً
     t2 = time.time()
-    todo = sorted((mt for mt, u in uni.items() if u["sec_ok"] is None and mt in lanes),
+    todo = sorted((mt for mt, u in uni.items() if u["sec_ok"] is None and mt in lanes and u.get("retry_at", 0) <= now),
                   key=lambda mt: (0 if lanes[mt] == "alpha" else 1, -metrics[mt]["vol1"]))[:SCAN_RUG_PER_CYCLE]
     if todo:
         try:
@@ -2514,8 +2751,16 @@ async def scan_cycle(app: Application) -> dict:
         if not m or not u["sec_ok"] or now - u["candle_ts"] < 120:
             continue
         if lanes.get(mint) == "alpha":
+            h_ = u.get("holders")
+            if ALPHA_MIN_HOLDERS > 0 and h_ is not None and h_ < ALPHA_MIN_HOLDERS:
+                st["skipped"]["مالكون قليلون"] = st["skipped"].get("مالكون قليلون", 0) + 1
+                continue
             if alpha_ok(m):
                 picks.append((100 + alpha_prescreen(m), mint))
+            else:
+                bp = bounce_prescreen(m)
+                if bp > 0:
+                    picks.append((50 + bp, mint))
             continue
         ps = bounce_prescreen(m)
         if SCAN_MOMENTUM and momentum_ok(m):
@@ -2544,20 +2789,24 @@ async def scan_cycle(app: Application) -> dict:
         sent = False
         try:
             if lanes.get(mint) == "alpha":
-                if regime["state"] == "bleeding" and m["chg5"] < ALPHA_MIN_CHG5 * 2:
-                    st["skipped"]["سوق نازف: زخم غير كافٍ"] = st["skipped"].get("سوق نازف: زخم غير كافٍ", 0) + 1
-                else:
+                if alpha_ok(m):
                     st["setups"] += 1
                     sent = await scan_send_alpha(app, sc, u, m, candles, regime, chat)
+                if not sent and candles:
+                    setup, _why = detect_bounce(candles, m)
+                    if setup and not (regime["state"] == "bleeding" and m["chg5"] < 0):
+                        st["setups"] += 1
+                        sent = await scan_send_bounce(app, sc, u, m, setup, candles, regime, chat)
             else:
                 setup, _why = detect_bounce(candles, m) if candles else (None, "")
                 if setup:
                     st["setups"] += 1
-                    if regime["state"] == "bleeding" and not (m["chg5"] >= 0 and setup["stars"] >= 3):
+                    if regime["state"] == "bleeding" and m["chg5"] < 0:
                         st["skipped"]["سوق نازف: تأكيد غير كافٍ"] = st["skipped"].get("سوق نازف: تأكيد غير كافٍ", 0) + 1
                     else:
                         sent = await scan_send_bounce(app, sc, u, m, setup, candles, regime, chat)
-                if not sent and SCAN_MOMENTUM and regime["state"] != "bleeding" and momentum_ok(m) and candles:
+                if (not sent and SCAN_MOMENTUM and (regime["state"] != "bleeding" or m["chg5"] >= 3)
+                        and momentum_ok(m) and candles):
                     sent = await scan_send_momentum(app, sc, u, m, candles, regime, chat)
         except asyncio.CancelledError:
             raise
@@ -2576,6 +2825,9 @@ async def scan_cycle(app: Application) -> dict:
 
 async def scan_send_bounce(app, sc: dict, u: dict, m: dict, setup: dict, candles: list, regime: dict, chat: int) -> bool:
     bd = app.bot_data
+    lvl, rtxt, ok = scan_risk_gate(sc, u, m)
+    if not ok:
+        return False
     it = scan_it(chat, m, u["sec_obj"])
     try:
         zones = find_supports_1m(candles, m.get("age_min"))
@@ -2587,10 +2839,13 @@ async def scan_send_bounce(app, sc: dict, u: dict, m: dict, setup: dict, candles
         text = inject_support(text, it, m, setup)
     except Exception:
         log.exception("scan inject failed")
-    await notify(app, it, scan_header("🔔 ارتداد", regime) + text)
-    _add_pos(sc, m, "AUTOB", setup["entry"], setup["sl"], setup["tp1"], setup["tp2"])
+    tp0 = tp0_for(lvl, setup["entry"], regime)
+    await notify(app, it, scan_header("🔔 ارتداد", regime) + rtxt + "\n" + quick_exit_line(lvl, setup["entry"], regime) + "\n" + text)
+    if lvl == "high":
+        sc.setdefault("hr", []).append(time.time())
+    _add_pos(sc, m, "AUTOB", setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], tp0)
     record_auto(bd, it, m, u["sec_obj"], "AUTOB", None, "★" * setup["stars"], setup["entry"], setup["sl"],
-                setup["tp1"], setup["tp2"], "ارتداد تلقائي من مسح السوق")
+                setup["tp1"], setup["tp2"], f"ارتداد تلقائي (مخاطرة {lvl})")
     return True
 
 
@@ -2601,33 +2856,51 @@ async def scan_send_momentum(app, sc: dict, u: dict, m: dict, candles: list, reg
     need = SCAN_MIN_SCORE + (0 if regime["state"] == "hot" else 5)
     if score < need:
         return False
+    lvl, rtxt, ok = scan_risk_gate(sc, u, m)
+    if not ok:
+        return False
+    if lvl == "high" or regime.get("state") == "bleeding":
+        tighten_plan(plan, 0.10)
     it = scan_it(chat, m, u["sec_obj"])
     c = Candidate(m, u["sec_obj"], plan, score, b)
-    await notify(app, it, scan_header("🚀 زخم", regime) + format_best(c, []))
-    _add_pos(sc, m, "AUTOM", plan.entry, plan.sl, plan.tp1, plan.tp2)
+    tp0 = tp0_for(lvl, plan.entry, regime)
+    await notify(app, it, scan_header("🚀 زخم", regime) + rtxt + "\n" + quick_exit_line(lvl, plan.entry, regime) + "\n" + format_best(c, []))
+    if lvl == "high":
+        sc.setdefault("hr", []).append(time.time())
+    _add_pos(sc, m, "AUTOM", plan.entry, plan.sl, plan.tp1, plan.tp2, tp0)
     record_auto(bd, it, m, u["sec_obj"], "AUTOM", score, "", plan.entry, plan.sl, plan.tp1, plan.tp2,
-                "زخم تلقائي من مسح السوق")
+                f"زخم تلقائي (مخاطرة {lvl})")
     return True
 
 
 async def scan_send_alpha(app, sc: dict, u: dict, m: dict, candles: list, regime: dict, chat: int) -> bool:
-    """عملة ناشئة: زخم حقيقي + أمان صارم. الشموع القليلة لا تمنعها (الوقف من آخر قاع أو −12%)."""
+    """عملة ناشئة: زخم حقيقي + أمان صارم + مخاطرة Rug معلنة. الشموع القليلة لا تمنعها."""
     bd = app.bot_data
     plan = compute_alt_plan("MOMENTUM", m, candles)
     score, b = compute_score(m, u["sec_obj"], plan)
     if score < ALPHA_MIN_SCORE:
         return False
+    lvl, rtxt, ok = scan_risk_gate(sc, u, m)
+    if not ok:
+        return False
+    if lvl == "high" or regime.get("state") == "bleeding":
+        tighten_plan(plan, 0.10)
     it = scan_it(chat, m, u["sec_obj"])
     c = Candidate(m, u["sec_obj"], plan, score, b)
     age = m.get("age_min") or 0
+    holders = u.get("holders")
     head = scan_header("🆕 عملة ناشئة", regime) + (
         f"⏱ عمر الزوج {age:.0f} دقيقة • MC {fmt_usd(m['mcap'])} • سيولة {fmt_usd(m['liq'])} • "
-        f"5د {m['chg5']:+.0f}% • 1س {m['chg1']:+.0f}% • شراء {m['buy_ratio5'] * 100:.0f}%\n"
-        f"🛡️ {html.escape(u.get('sec_txt') or '')}\n\n")
+        f"5د {m['chg5']:+.0f}% • 1س {m['chg1']:+.0f}% • شراء {m['buy_ratio5'] * 100:.0f}%"
+        + (f" • {holders:.0f} مالك" if holders is not None else "") + "\n"
+        f"🛡️ {html.escape(u.get('sec_txt') or '')}\n" + rtxt + "\n" + quick_exit_line(lvl, plan.entry, regime) + "\n")
+    tp0 = tp0_for(lvl, plan.entry, regime)
     await notify(app, it, head + format_best(c, []))
-    _add_pos(sc, m, "AUTOM", plan.entry, plan.sl, plan.tp1, plan.tp2)
+    if lvl == "high":
+        sc.setdefault("hr", []).append(time.time())
+    _add_pos(sc, m, "AUTOM", plan.entry, plan.sl, plan.tp1, plan.tp2, tp0)
     record_auto(bd, it, m, u["sec_obj"], "AUTOM", score, "", plan.entry, plan.sl, plan.tp1, plan.tp2,
-                "عملة ناشئة من مسح السوق")
+                f"عملة ناشئة (مخاطرة {lvl})")
     return True
 
 
@@ -2661,6 +2934,9 @@ def scan_status_text(sc: dict) -> str:
             lines.append("• رُفضت بالفلتر: " + "، ".join(f"{k} {v}" for k, v in sorted(last["filter"].items(), key=lambda kv: -kv[1])[:5]))
         if last["skipped"]:
             lines.append("• تخطّيت: " + "، ".join(f"{k} {v}" for k, v in last["skipped"].items()))
+    rg_state = (sc.get("regime") or {}).get("state", "unknown")
+    lines.append(SCAN_STRATEGY.get(rg_state, ""))
+    lines.append(f"🍼 حضانة العملات الجديدة: {len(sc.get('nur') or {})} عملة تحت المراقبة اللحظية")
     uni = sc.get("uni") or {}
     vet = sum(1 for u in uni.values() if u.get("sec_ok"))
     lines.append(f"\n🗂️ الكون: {len(uni)} عملة ({vet} مفحوصة وسليمة) • صفقات مفتوحة: {len(sc.get('pos') or {})} • "
@@ -2670,6 +2946,7 @@ def scan_status_text(sc: dict) -> str:
 
 async def scan_loop(app: Application) -> None:
     """حلقة مستقلة: كل دورة بمهلة صارمة، وأي فشل لا يوقفها، وتنام دائماً بين الدورات."""
+    GECKO_LANE.set("scan")
     await asyncio.sleep(30)
     while True:
         sc = app.bot_data.setdefault("scan", {"on": SCAN_DEFAULT_ON, "chat": 0})
@@ -2749,6 +3026,7 @@ async def scan_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not sc.get("chat"):
         sc["chat"] = update.effective_chat.id
         save_scan_state(sc)
+    GECKO_LANE.set("scan")
     status = await update.effective_message.reply_text("🔎 دورة مسح فورية... (قد تستغرق دقيقة إلى دقيقتين)")
     try:
         await asyncio.wait_for(scan_cycle(context.application), timeout=SCAN_CYCLE_TIMEOUT)
@@ -3983,6 +4261,49 @@ async def keepalive_loop(client: httpx.AsyncClient) -> None:
             log.warning("Keep-alive failed: %s", e)
 
 
+async def supervised(name: str, factory, app: Application) -> None:
+    """يعيد تشغيل الحلقة تلقائياً إن سقطت لأي سبب: لا شيء يوقف البوت 24/24."""
+    delay = 5.0
+    while True:
+        started = time.time()
+        try:
+            await factory(app)
+            return                      # عودة طبيعية (مثل keep-alive المعطّل): لا إعادة تشغيل
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("loop %s crashed; restarting in %.0fs", name, delay)
+        if time.time() - started > 300:
+            delay = 5.0
+        await asyncio.sleep(delay)
+        delay = min(120.0, delay * 2)
+
+
+async def watchdog_loop(app: Application) -> None:
+    """ينبّهك (مرة بالساعة كحد أقصى) إذا تعثّر المسح أكثر من 20 دقيقة، بدل أن يصمت دون أن تعرف."""
+    boot = time.time()
+    last_warn = 0.0
+    await asyncio.sleep(300)
+    while True:
+        try:
+            sc = app.bot_data.get("scan") or {}
+            if sc.get("on") and sc.get("chat"):
+                ref = sc.get("ok_ts") or boot
+                if time.time() - ref > 1200 and time.time() - last_warn > 3600:
+                    last_warn = time.time()
+                    await app.bot.send_message(
+                        chat_id=sc["chat"], parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                        text=(f"⚠️ <b>المسح متعثر</b> منذ {int((time.time() - ref) / 60)} دقيقة "
+                              f"(إخفاقات متتالية: {sc.get('fails', 0)}).\n"
+                              f"آخر خطأ: {html.escape(str(sc.get('err', 'غير معروف')))}\n"
+                              "البوت يعيد المحاولة تلقائياً؛ جرّب /scan_now أو /diag لمعرفة المصدر المعطّل."))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("watchdog failed")
+        await asyncio.sleep(120)
+
+
 async def run_all() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start_cmd))
@@ -4009,10 +4330,12 @@ async def run_all() -> None:
     await post_init(app)
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-    keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
-    watcher = asyncio.create_task(watch_loop(app))
-    scanner = asyncio.create_task(scan_loop(app))
-    log.info("SolAlpha Sniper v5.0 is running — signal channel: @%s", SIGNAL_CHANNEL)
+    keepalive = asyncio.create_task(supervised("keepalive", lambda a: keepalive_loop(a.bot_data["http"]), app))
+    watcher = asyncio.create_task(supervised("watch", watch_loop, app))
+    scanner = asyncio.create_task(supervised("scan", scan_loop, app))
+    guard = asyncio.create_task(supervised("guard", scan_guard_loop, app))
+    dog = asyncio.create_task(watchdog_loop(app))
+    log.info("SolAlpha Sniper v5.2 is running — signal channel: @%s", SIGNAL_CHANNEL)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -4029,6 +4352,8 @@ async def run_all() -> None:
         keepalive.cancel()
         watcher.cancel()
         scanner.cancel()
+        guard.cancel()
+        dog.cancel()
         try:
             await app.updater.stop()
             await app.stop()
